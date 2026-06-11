@@ -1,0 +1,15 @@
+# heavy raw data (MT5 1-min exports) — not committed; place CSVs here locally:
+#   NAS100 DATA/NAS100 TRAINING.csv / NAS100 VALIDATION.csv / NAS100 LOCKED OOS.csv
+NAS100 DATA/
+
+# derived caches (rebuilt by nas100_rl.data / rl.signals / rl.features)
+data_cache/
+
+# intermediate training snapshots (final/deploy seed weights ARE committed)
+nas100_rl/checkpoints/*_u*.pt
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store

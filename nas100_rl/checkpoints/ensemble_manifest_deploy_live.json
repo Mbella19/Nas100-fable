@@ -1,0 +1,26 @@
+{
+  "config": {
+    "var_penalty": 0.08,
+    "kl_coef": 0.05,
+    "score": -0.24152658013132877,
+    "budget": 27
+  },
+  "updates": 27,
+  "seeds": [
+    "deploy_live_seed0.pt",
+    "deploy_live_seed1.pt",
+    "deploy_live_seed2.pt",
+    "deploy_live_seed3.pt",
+    "deploy_live_seed4.pt",
+    "deploy_live_seed5.pt",
+    "deploy_live_seed6.pt",
+    "deploy_live_seed7.pt",
+    "deploy_live_seed8.pt"
+  ],
+  "fit_through": "val",
+  "prior_actions": {
+    "0": 2,
+    "1": 2,
+    "2": 2
+  }
+}

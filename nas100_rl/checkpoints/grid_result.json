@@ -1,0 +1,34 @@
+{
+  "best": {
+    "var_penalty": 0.03,
+    "kl_coef": 0.05,
+    "score": -0.05390020075815277,
+    "budget": 25
+  },
+  "all": [
+    {
+      "var_penalty": 0.03,
+      "kl_coef": 0.05,
+      "score": -0.05390020075815277,
+      "budget": 25
+    },
+    {
+      "var_penalty": 0.03,
+      "kl_coef": 0.15,
+      "score": -0.2064835340914861,
+      "budget": 37
+    },
+    {
+      "var_penalty": 0.08,
+      "kl_coef": 0.05,
+      "score": -0.12428908964704162,
+      "budget": 37
+    },
+    {
+      "var_penalty": 0.08,
+      "kl_coef": 0.15,
+      "score": -0.14724742298037494,
+      "budget": 25
+    }
+  ]
+}

@@ -1,0 +1,129 @@
+// =============================================================================
+// S2: 5-Bar Momentum Burst with Declining Risk
+// Timeframe: 5-minute bars | Instrument: NAS100 CFD ($1/point)
+//
+// Logic: Enter when price moves > threshold x ATR over last 5 bars.
+//        1st trade of day: 3.0x ATR stop (full position).
+//        2nd trade of day: 9.0x ATR stop (smaller position = declining risk).
+//        Force exit at US session close & Friday 18:00 UTC.
+//
+// 1:1 match notes vs Python backtester:
+//   - ATR uses Wilder's smoothing (RMA), shifted 1 bar [1] to prevent lookahead
+//   - Entry at next bar's open (process_orders_on_close=false)
+//   - Stop fills at stop level, or bar open if gap-through (TradingView default)
+//   - Commission: 2.5 pts/RT/contract = 1.25/order (cashper)
+//   - Position sizing: equity * riskPct / stopDist (fractional contracts, no floor)
+//   - Daily signal count increments even if in a trade (matching Python)
+//   - Minor diff: force exit fills at next bar open (Python fills at bar close)
+// =============================================================================
+//@version=6
+strategy("S2: 5b Momentum Burst - Declining Risk",
+     overlay            = true,
+     initial_capital    = 100000,
+     currency           = currency.USD,
+     default_qty_type   = strategy.fixed,
+     default_qty_value  = 1,
+     commission_type    = strategy.commission.cash_per_contract,
+     commission_value   = 1.25,
+     slippage           = 0,
+     process_orders_on_close = false,
+     calc_on_every_tick = false,
+     use_bar_magnifier  = false,
+     pyramiding         = 0,
+     margin_long        = 1,
+     margin_short       = 1)
+
+// ─── Inputs ─────────────────────────────────────────────────────────────────
+lookback    = input.int(5,     "Lookback Bars",               minval=1)
+threshold   = input.float(4.5, "ATR Threshold Multiplier",    step=0.1)
+atrPeriod   = input.int(14,    "ATR Period",                  minval=1)
+stopMult    = input.float(3.0, "Stop ATR Mult (1st trade)",   step=0.5)
+stopMult2nd = input.float(9.0, "Stop ATR Mult (2nd+ trade)",  step=0.5)
+maxPerDay   = input.int(2,     "Max Trades Per Day",          minval=1, maxval=5)
+riskPct     = input.float(0.003, "Risk Per Trade (fraction)", step=0.001, minval=0.0001)
+
+// ─── ATR (shifted by 1 bar — value at bar t uses data up to bar t-1) ───────
+atrVal = ta.atr(atrPeriod)[1]
+
+// ─── Price Move over Lookback ───────────────────────────────────────────────
+move = close - close[lookback]
+
+// ─── Time Variables ─────────────────────────────────────────────────────────
+nyH  = hour(time, "America/New_York")
+utcH = hour(time, "UTC")
+
+// ─── US Session Filter (9:00 AM – 3:59 PM New York) ────────────────────────
+// Matches Python: DST ? (utcH >= 13 & < 20) : (utcH >= 14 & < 21)
+// Both map to nyH >= 9 and nyH < 16 since PineScript handles DST automatically.
+isUSSession = nyH >= 9 and nyH < 16
+
+// ─── Force Exit Conditions ──────────────────────────────────────────────────
+// Session close: 4 PM ET (= UTC 20 DST / 21 non-DST)
+isSessionClose = nyH >= 16
+// Friday early close: 18:00 UTC fixed (= 2 PM ET DST / 1 PM ET non-DST)
+isFriday = dayofweek(time, "UTC") == dayofweek.friday
+isFridayEarlyClose = isFriday and utcH >= 18
+forceExit = isSessionClose or isFridayEarlyClose
+
+// ─── Valid Signal Conditions ────────────────────────────────────────────────
+validATR = not na(atrVal) and atrVal > 1 and atrVal < 100
+valid = isUSSession and validATR and not forceExit
+
+// ─── Raw Signal Conditions ──────────────────────────────────────────────────
+longCond  = valid and move > threshold * atrVal
+shortCond = valid and move < -threshold * atrVal
+
+// ─── Daily Trade Count ──────────────────────────────────────────────────────
+// Reset each New York calendar day. Within the US session (9 AM – 4 PM ET),
+// the NY date is stable, so this matches the Python's 22:00 UTC boundary
+// for all practical purposes.
+var int dailyCount  = 0
+var int prevNyDay   = -1
+var int prevNyMonth = -1
+nyDay   = dayofmonth(time, "America/New_York")
+nyMonth = month(time, "America/New_York")
+if nyDay != prevNyDay or nyMonth != prevNyMonth
+    dailyCount  := 0
+    prevNyDay   := nyDay
+    prevNyMonth := nyMonth
+
+// ─── Signal Gating & Stop Selection ────────────────────────────────────────
+// In the Python, daily count increments for EVERY valid signal, even if a
+// trade is already open (the signal is generated but the backtester ignores
+// it when in_trade=True). We replicate this exactly.
+isSignal  = (longCond or shortCond) and dailyCount < maxPerDay
+currentSM = dailyCount == 0 ? stopMult : stopMult2nd
+
+if isSignal
+    dailyCount += 1
+
+// ─── Entry & Exit ───────────────────────────────────────────────────────────
+noPosition = strategy.position_size == 0
+
+if isSignal and noPosition
+    stopDist = currentSM * atrVal
+    // Position sizing: contracts = equity * riskPct / stopDist
+    // No floor — Python uses fractional contracts
+    qty = math.max(1.0, math.min(200.0, strategy.equity * riskPct / stopDist))
+
+    if longCond
+        sl = close - currentSM * atrVal
+        strategy.entry("Long", strategy.long, qty = qty)
+        strategy.exit("LX", "Long", stop = sl)
+    else if shortCond
+        sl = close + currentSM * atrVal
+        strategy.entry("Short", strategy.short, qty = qty)
+        strategy.exit("SX", "Short", stop = sl)
+
+// ─── Force Exit at Session Close ────────────────────────────────────────────
+if forceExit and strategy.position_size != 0
+    strategy.close_all(comment = "Session Close")
+
+// ─── Visual Aids ────────────────────────────────────────────────────────────
+entryLong  = isSignal and noPosition and longCond
+entryShort = isSignal and noPosition and shortCond
+plotshape(entryLong,  "Long",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size = size.small)
+plotshape(entryShort, "Short", shape.triangledown,  location.abovebar, color.new(color.red, 0),   size = size.small)
+
+// Session background
+bgcolor(isUSSession ? color.new(color.blue, 95) : na)

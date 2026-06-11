@@ -1,0 +1,665 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  Chart Patterns Multi-TF Strategy v12 — 1:1 port of the Python research
+//  build that passed training / validation / locked-OOS on US30, NAS100,
+//  XAUUSD (config sha 96bceb79…, see reports/FINAL_REPORT.md).
+//
+//  REQUIRED CHART SETUP
+//   • Chart timeframe MUST be 30 minutes (script refuses anything else);
+//     all six detector streams (4h, 3h, 2h, 6h, 1h, 30m) derive from it.
+//   • Properties → enable "Use bar magnifier" so stops fill intrabar like
+//     the research engine's 1-minute fills.
+//
+//  REPRODUCING v12 EXACTLY
+//   Research held one long AND one short slot simultaneously. Pine cannot
+//   hedge, so either add the script twice (one "Long only" + one "Short
+//   only" instance; sum the results) or accept the netted approximation
+//   with "Both (single position)".
+//
+//  COSTS (TV has one price feed; emulate the MT5 spread via slippage in
+//  Properties): US30 ≈ 28 ticks, NAS100 ≈ 13 ticks, XAUUSD ≈ 12 ticks +
+//  commission ≈ $0.035 per contract per side. Initial capital 10'000.
+//
+//  KNOWN EXECUTION DIFFERENCES vs the research engine (logic itself is 1:1):
+//   • trail level updates per 30m bar instead of per minute (same
+//     prior-extreme-minus-fixed-unit convention);
+//   • entries gapping straight through the stop are taken then stopped
+//     (research skipped those rare weekend cases);
+//   • sizing uses the signal-bar stop distance (research re-sized on fill);
+//   • TV session anchoring of 2h/3h/4h/6h bars may differ from the MT5
+//     midnight-anchored resample, shifting some pivots/patterns slightly.
+// ═══════════════════════════════════════════════════════════════════════════
+strategy("Chart Patterns Multi-TF v12", "CPMT v12", overlay = true,
+     initial_capital = 10000, pyramiding = 0,
+     calc_on_every_tick = false, process_orders_on_close = false,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0,
+     slippage = 0, max_lines_count = 500, max_labels_count = 500)
+
+// ═══════════════════════════ Inputs ═══════════════════════════
+GRP_X = "Execution"
+GRP_S = "Strategy (frozen v12 — change only to experiment)"
+GRP_P = "Patterns"
+
+dirMode = input.string("Both (single position)", "Direction",
+     options = ["Both (single position)", "Long only", "Short only"], group = GRP_X,
+     tooltip = "v12 ran one long AND one short slot in parallel. To replicate exactly, add this strategy twice: one 'Long only' and one 'Short only' instance, then sum the results.")
+riskPct = input.float(2.0, "Risk % of realized equity per trade", minval = 0.1, maxval = 10, step = 0.5, group = GRP_X)
+qtyStep = input.float(0.01, "Quantity step", minval = 0.000001, group = GRP_X)
+qtyMin  = input.float(0.01, "Minimum quantity", minval = 0.0, group = GRP_X)
+qtyMax  = input.float(100.0, "Maximum quantity", minval = 0.1, group = GRP_X)
+tzIn    = input.string("GMT+3", "Broker timezone for blackout hours", group = GRP_X,
+     tooltip = "Research data was MT5 server time (≈GMT+2/+3): 23:00–01:00 covers the rollover spread spike. Align to this symbol's quiet hours.")
+
+trailMult = input.float(2.5, "Trail, ATR(14) units", minval = 0.5, step = 0.25, group = GRP_S)
+stopFloor = input.float(1.0, "Stop floor, ATR", minval = 0.1, step = 0.25, group = GRP_S)
+stopCap   = input.float(2.5, "Stop cap, ATR", minval = 0.5, step = 0.25, group = GRP_S)
+tsMult    = input.float(3.0, "Time stop, × pattern width", minval = 0.0, step = 0.5, group = GRP_S)
+gateLen   = input.int(10, "Daily trend EMA length", minval = 2, group = GRP_S)
+gateBand  = input.float(0.25, "Soft-gate band, daily ATR", minval = 0.0, step = 0.05, group = GRP_S,
+     tooltip = "Gated streams (all but 4h) skip entries only when the last CLOSED daily bar is beyond EMA ± band AGAINST the trade; near the EMA both directions trade.")
+blkStr    = input.string("23,0,1", "Blackout entry hours (server)", group = GRP_S)
+tolIn     = input.float(25, "Equality tolerance, %", minval = 5, maxval = 50, step = 5, group = GRP_S)
+maxWidth  = input.int(200, "Max pattern width, bars", minval = 0, group = GRP_S)
+maxPat    = input.int(20, "Max patterns kept per engine", minval = 1, maxval = 40, group = GRP_S)
+
+useDT  = input.bool(true, "Double Top", group = GRP_P)
+useDB  = input.bool(true, "Double Bottom", group = GRP_P)
+useTT  = input.bool(true, "Triple Top", group = GRP_P)
+useTB  = input.bool(true, "Triple Bottom", group = GRP_P)
+useHS  = input.bool(true, "Head and Shoulders", group = GRP_P)
+useIHS = input.bool(true, "Inverted Head and Shoulders", group = GRP_P)
+useBF  = input.bool(true, "Bullish Flag", group = GRP_P)
+useSF  = input.bool(true, "Bearish Flag", group = GRP_P)
+useBP  = input.bool(true, "Bullish Pennant", group = GRP_P)
+useSP  = input.bool(true, "Bearish Pennant", group = GRP_P)
+useRW  = input.bool(true, "Rising Wedge", group = GRP_P)
+useFW  = input.bool(true, "Falling Wedge", group = GRP_P)
+useTRI = input.bool(true, "Triangle", group = GRP_P)
+useREC = input.bool(true, "Rectangle", group = GRP_P)
+
+tol = tolIn / 100.0
+
+if not (timeframe.isintraday and timeframe.multiplier == 30)
+    runtime.error("CPMT v12 must run on a 30-minute chart (all six detector streams derive from it).")
+
+// ═══════════════════════════ Pattern engine ═══════════════════════════
+// Identical math to the research engine and the companion indicator:
+// zigzag on confirmed ta.pivothigh/low, priority-ordered detection of the 14
+// patterns, FORMING → AWAIT on a close through the boundary, expiry and
+// invalidation handling. No drawings — engines only emit break events.
+
+ST_FORMING = 0
+ST_AWAIT   = 1
+ST_REACHED = 2
+ST_FAILED  = 3
+
+type Pat
+    string name
+    int    dir
+    bool   two
+    array<int>   xs
+    array<float> ys
+    int   nx1
+    float ny1
+    int   nx2
+    float ny2
+    int   mx1
+    float my1
+    int   mx2
+    float my2
+    float tgtSize
+    float invLevel
+    int   expiryBar
+    int   status = 0
+    float target = na
+
+valAt(int x1, float y1, int x2, float y2, int x) =>
+    x2 == x1 ? y2 : y1 + (y2 - y1) * (x - x1) / (x2 - x1)
+
+zp(array<float> P, int i) =>
+    P.get(P.size() - 1 - i)
+
+zb(array<int> B, int i) =>
+    B.get(B.size() - 1 - i)
+
+mkXs(array<int> B, int k) =>
+    array<int> a = array.new<int>()
+    for i = 0 to k - 1
+        a.push(zb(B, k - 1 - i))
+    a
+
+mkYs(array<float> P, int k) =>
+    array<float> a = array.new<float>()
+    for i = 0 to k - 1
+        a.push(zp(P, k - 1 - i))
+    a
+
+addPivot(array<float> zzP, array<int> zzB, array<int> zzD, int d, float price, int b) =>
+    bool changed = false
+    if zzD.size() == 0
+        zzP.push(price)
+        zzB.push(b)
+        zzD.push(d)
+        changed := true
+    else if zzD.last() == d
+        if (d > 0 and price > zzP.last()) or (d < 0 and price < zzP.last())
+            zzP.set(zzP.size() - 1, price)
+            zzB.set(zzB.size() - 1, b)
+            changed := true
+    else
+        zzP.push(price)
+        zzB.push(b)
+        zzD.push(d)
+        changed := true
+    if zzP.size() > 60
+        zzP.shift()
+        zzB.shift()
+        zzD.shift()
+    changed
+
+newPat(array<Pat> pats, string name, int dir, bool two, array<int> xs, array<float> ys,
+     int nx1, float ny1, int nx2, float ny2,
+     int mx1, float my1, int mx2, float my2,
+     float tgtSize, float invLev) =>
+    int w = xs.last() - xs.first()
+    if maxWidth == 0 or w <= maxWidth
+        Pat p = Pat.new()
+        p.name := name
+        p.dir := dir
+        p.two := two
+        p.xs := xs
+        p.ys := ys
+        p.nx1 := nx1
+        p.ny1 := ny1
+        p.nx2 := nx2
+        p.ny2 := ny2
+        p.mx1 := mx1
+        p.my1 := my1
+        p.mx2 := mx2
+        p.my2 := my2
+        p.tgtSize := tgtSize
+        p.invLevel := invLev
+        p.expiryBar := xs.last() + math.max(20, 2 * w)
+        if two
+            float sU = (my2 - my1) / math.max(1, mx2 - mx1)
+            float sL = (ny2 - ny1) / math.max(1, nx2 - nx1)
+            if math.abs(sU - sL) > 1e-10
+                float apexX = ((ny1 - sL * nx1) - (my1 - sU * mx1)) / (sU - sL)
+                if not na(apexX) and apexX > xs.last()
+                    p.expiryBar := math.min(p.expiryBar, int(apexX))
+        // a new pattern supersedes overlapping still-forming ones
+        array<int> rm = array.new<int>()
+        if pats.size() > 0
+            for i = 0 to pats.size() - 1
+                Pat q = pats.get(i)
+                if q.status == ST_FORMING and q.xs.last() >= xs.first()
+                    rm.push(i)
+        if rm.size() > 0
+            for j = 0 to rm.size() - 1
+                pats.remove(rm.get(rm.size() - 1 - j))
+        pats.push(p)
+        while pats.size() > maxPat
+            pats.shift()
+        true
+
+detectPat(array<float> zzP, array<int> zzB, array<int> zzD, array<Pat> pats, int t) =>
+    bool added = false
+    int n = zzP.size()
+    if n >= 4
+        float p0 = zp(zzP, 0)
+        float p1 = zp(zzP, 1)
+        float p2 = zp(zzP, 2)
+        float p3 = zp(zzP, 3)
+        int b0 = zb(zzB, 0)
+        int b1 = zb(zzB, 1)
+        int b2 = zb(zzB, 2)
+        int b3 = zb(zzB, 3)
+        int d0 = zb(zzD, 0)
+        float p4 = n >= 5 ? zp(zzP, 4) : na
+        int   b4 = n >= 5 ? zb(zzB, 4) : -1
+        float p5 = n >= 6 ? zp(zzP, 5) : na
+
+        // ── Triple Top
+        if not added and useTT and d0 == 1 and n >= 6
+            float neckY = math.min(p3, p1)
+            float hi = math.max(p0, math.max(p2, p4))
+            float lo = math.min(p0, math.min(p2, p4))
+            float h = hi - neckY
+            if h > 0 and hi - lo <= tol * h and lo > neckY and p5 < neckY
+                newPat(pats, "Triple Top", -1, false, mkXs(zzB, 5), mkYs(zzP, 5),
+                     b4, neckY, b0, neckY, -1, float(na), -1, float(na), h, hi)
+                added := true
+
+        // ── Triple Bottom
+        if not added and useTB and d0 == -1 and n >= 6
+            float neckY = math.max(p3, p1)
+            float lo = math.min(p0, math.min(p2, p4))
+            float hi = math.max(p0, math.max(p2, p4))
+            float h = neckY - lo
+            if h > 0 and hi - lo <= tol * h and hi < neckY and p5 > neckY
+                newPat(pats, "Triple Bottom", 1, false, mkXs(zzB, 5), mkYs(zzP, 5),
+                     b4, neckY, b0, neckY, -1, float(na), -1, float(na), h, lo)
+                added := true
+
+        // ── Head and Shoulders
+        if not added and useHS and d0 == 1 and n >= 6
+            float head = p2
+            float ls = p4
+            float rs = p0
+            float neckMin = math.min(p3, p1)
+            float h = head - neckMin
+            if h > 0 and head - math.max(ls, rs) > tol * h and math.abs(ls - rs) <= 1.5 * tol * h and
+                 math.min(ls, rs) > math.max(p3, p1) and math.abs(p3 - p1) <= 0.5 * h and p5 < neckMin
+                float tgt = head - valAt(b3, p3, b1, p1, b2)
+                newPat(pats, "Head and Shoulders", -1, false, mkXs(zzB, 5), mkYs(zzP, 5),
+                     b3, p3, b1, p1, -1, float(na), -1, float(na), tgt, head)
+                added := true
+
+        // ── Inverted Head and Shoulders
+        if not added and useIHS and d0 == -1 and n >= 6
+            float head = p2
+            float ls = p4
+            float rs = p0
+            float neckMax = math.max(p3, p1)
+            float h = neckMax - head
+            if h > 0 and math.min(ls, rs) - head > tol * h and math.abs(ls - rs) <= 1.5 * tol * h and
+                 math.max(ls, rs) < math.min(p3, p1) and math.abs(p3 - p1) <= 0.5 * h and p5 > neckMax
+                float tgt = valAt(b3, p3, b1, p1, b2) - head
+                newPat(pats, "Inv. Head and Shoulders", 1, false, mkXs(zzB, 5), mkYs(zzP, 5),
+                     b3, p3, b1, p1, -1, float(na), -1, float(na), tgt, head)
+                added := true
+
+        // ── Rectangle
+        if not added and useREC and n >= 5
+            float hiMax = d0 == 1 ? math.max(p4, p2, p0) : math.max(p3, p1)
+            float hiMin = d0 == 1 ? math.min(p4, p2, p0) : math.min(p3, p1)
+            float loMax = d0 == 1 ? math.max(p3, p1) : math.max(p4, p2, p0)
+            float loMin = d0 == 1 ? math.min(p3, p1) : math.min(p4, p2, p0)
+            float top = math.avg(hiMax, hiMin)
+            float bot = math.avg(loMax, loMin)
+            float h = top - bot
+            if h > 0 and hiMin > loMax and hiMax - hiMin <= tol * h and loMax - loMin <= tol * h
+                newPat(pats, "Rectangle", 0, true, mkXs(zzB, 5), mkYs(zzP, 5),
+                     b4, bot, b0, bot, b4, top, b0, top, h, float(na))
+                added := true
+
+        // ── Double Top
+        if not added and useDT and d0 == 1
+            float h = math.max(p2, p0) - p1
+            if h > 0 and math.abs(p0 - p2) <= tol * h and p3 < p1
+                newPat(pats, "Double Top", -1, false, mkXs(zzB, 3), mkYs(zzP, 3),
+                     b2, p1, b0, p1, -1, float(na), -1, float(na), h, math.max(p2, p0))
+                added := true
+
+        // ── Double Bottom
+        if not added and useDB and d0 == -1
+            float h = p1 - math.min(p2, p0)
+            if h > 0 and math.abs(p0 - p2) <= tol * h and p3 > p1
+                newPat(pats, "Double Bottom", 1, false, mkXs(zzB, 3), mkYs(zzP, 3),
+                     b2, p1, b0, p1, -1, float(na), -1, float(na), h, math.min(p2, p0))
+                added := true
+
+        // ── Bullish Flag
+        if not added and useBF and d0 == -1 and n >= 5
+            float pole = p3 - p4
+            float hC = ((p3 - p2) + (p1 - p0)) / 2
+            int wC = b0 - b3
+            float sH = (p1 - p3) / math.max(1, b1 - b3)
+            float sL = (p0 - p2) / math.max(1, b0 - b2)
+            if pole > 0 and hC > 0 and pole >= 2.0 * hC and p1 < p3 and p0 < p2 and
+                 p3 - math.min(p0, p2) <= 0.6 * pole and
+                 math.abs(sH - sL) * wC <= 2 * tol * hC and b3 - b4 <= 2 * wC
+                newPat(pats, "Bullish Flag", 1, true, mkXs(zzB, 5), mkYs(zzP, 5),
+                     b2, p2, b0, p0, b3, p3, b1, p1, pole, p4 + 0.3 * pole)
+                added := true
+
+        // ── Bearish Flag
+        if not added and useSF and d0 == 1 and n >= 5
+            float pole = p4 - p3
+            float hC = ((p2 - p3) + (p0 - p1)) / 2
+            int wC = b0 - b3
+            float sH = (p0 - p2) / math.max(1, b0 - b2)
+            float sL = (p1 - p3) / math.max(1, b1 - b3)
+            if pole > 0 and hC > 0 and pole >= 2.0 * hC and p1 > p3 and p0 > p2 and
+                 math.max(p0, p2) - p3 <= 0.6 * pole and
+                 math.abs(sH - sL) * wC <= 2 * tol * hC and b3 - b4 <= 2 * wC
+                newPat(pats, "Bearish Flag", -1, true, mkXs(zzB, 5), mkYs(zzP, 5),
+                     b3, p3, b1, p1, b2, p2, b0, p0, pole, p4 - 0.3 * pole)
+                added := true
+
+        // ── Bullish Pennant
+        if not added and useBP and d0 == -1 and n >= 5
+            float pole = p3 - p4
+            float hC = p3 - p2
+            if pole > 0 and hC > 0 and pole >= 2.0 * hC and p1 < p3 and p0 > p2 and
+                 b3 - b4 <= 2 * (b0 - b3)
+                newPat(pats, "Bullish Pennant", 1, true, mkXs(zzB, 5), mkYs(zzP, 5),
+                     b2, p2, b0, p0, b3, p3, b1, p1, pole, p4 + 0.3 * pole)
+                added := true
+
+        // ── Bearish Pennant
+        if not added and useSP and d0 == 1 and n >= 5
+            float pole = p4 - p3
+            float hC = p2 - p3
+            if pole > 0 and hC > 0 and pole >= 2.0 * hC and p1 > p3 and p0 < p2 and
+                 b3 - b4 <= 2 * (b0 - b3)
+                newPat(pats, "Bearish Pennant", -1, true, mkXs(zzB, 5), mkYs(zzP, 5),
+                     b3, p3, b1, p1, b2, p2, b0, p0, pole, p4 - 0.3 * pole)
+                added := true
+
+        // ── Wedges & Triangle
+        if not added and n >= 5 and (useRW or useFW or useTRI)
+            int ux1 = d0 == 1 ? b4 : b3
+            float uy1 = d0 == 1 ? p4 : p3
+            int ux2 = d0 == 1 ? b0 : b1
+            float uy2 = d0 == 1 ? p0 : p1
+            int lx1 = d0 == 1 ? b3 : b4
+            float ly1 = d0 == 1 ? p3 : p4
+            int lx2 = d0 == 1 ? b1 : b0
+            float ly2 = d0 == 1 ? p1 : p0
+            float fitErr = math.abs(p2 - valAt(b4, p4, b0, p0, b2))
+            float hS = valAt(ux1, uy1, ux2, uy2, b4) - valAt(lx1, ly1, lx2, ly2, b4)
+            float hE = valAt(ux1, uy1, ux2, uy2, b0) - valAt(lx1, ly1, lx2, ly2, b0)
+            int w = b0 - b4
+            if hS > 0 and hE > 0 and hE <= 0.85 * hS and fitErr <= tol * hS
+                float sUn = (uy2 - uy1) / math.max(1, ux2 - ux1) * w / hS
+                float sLn = (ly2 - ly1) / math.max(1, lx2 - lx1) * w / hS
+                array<int> xsW = mkXs(zzB, 5)
+                array<float> ysW = mkYs(zzP, 5)
+                if useRW and sUn > 0.2 and sLn > 0.2
+                    newPat(pats, "Rising Wedge", -1, true, xsW, ysW,
+                         lx1, ly1, lx2, ly2, ux1, uy1, ux2, uy2, hS, ysW.max())
+                    added := true
+                else if useFW and sUn < -0.2 and sLn < -0.2
+                    newPat(pats, "Falling Wedge", 1, true, xsW, ysW,
+                         lx1, ly1, lx2, ly2, ux1, uy1, ux2, uy2, hS, ysW.min())
+                    added := true
+                else if useTRI and sUn <= 0.2 and sLn >= -0.2
+                    newPat(pats, "Triangle", 0, true, xsW, ysW,
+                         lx1, ly1, lx2, ly2, ux1, uy1, ux2, uy2, hS, float(na))
+                    added := true
+    added
+
+// status machine on the engine's confirmed bar; fills evb with the FIRST
+// up-break and FIRST dn-break of this bar: [uPx, uInv, uW, dPx, dInv, dW]
+updStatus(array<Pat> pats, int t, float hi, float lo, float cl, array<float> evb) =>
+    for p in pats
+        if p.status == ST_FORMING
+            float upL = p.two ? valAt(p.mx1, p.my1, p.mx2, p.my2, t) : valAt(p.nx1, p.ny1, p.nx2, p.ny2, t)
+            float dnL = valAt(p.nx1, p.ny1, p.nx2, p.ny2, t)
+            bool failNow = not na(p.invLevel) and p.dir != 0 and
+                 (p.dir < 0 ? cl > p.invLevel : cl < p.invLevel)
+            bool brokeUp = not failNow and p.dir >= 0 and cl > upL
+            bool brokeDn = not failNow and p.dir <= 0 and cl < dnL
+            bool didBreak = brokeUp or brokeDn
+            if didBreak
+                int dirBk = brokeUp ? 1 : -1
+                p.dir := dirBk
+                p.status := ST_AWAIT
+                float lineP = dirBk > 0 ? upL : dnL
+                p.target := lineP + (dirBk > 0 ? p.tgtSize : -p.tgtSize)
+                if na(p.invLevel)
+                    p.invLevel := dirBk > 0 ? p.ys.min() : p.ys.max()
+                float w = p.xs.last() - p.xs.first()
+                if dirBk > 0 and na(evb.get(0))
+                    evb.set(0, lineP)
+                    evb.set(1, p.invLevel)
+                    evb.set(2, w)
+                if dirBk < 0 and na(evb.get(3))
+                    evb.set(3, lineP)
+                    evb.set(4, p.invLevel)
+                    evb.set(5, w)
+            if not didBreak and (failNow or t > p.expiryBar)
+                p.status := ST_FAILED
+        else if p.status == ST_AWAIT
+            bool hit = p.dir > 0 ? hi >= p.target : lo <= p.target
+            if hit
+                p.status := ST_REACHED
+            else if not na(p.invLevel) and (p.dir > 0 ? cl < p.invLevel : cl > p.invLevel)
+                p.status := ST_FAILED
+
+// one detector instance: first up/dn break of THIS confirmed bar (else na)
+// plus the bar's ATR(14). State is per-call-site, so every (timeframe,
+// pivot-length) pair below is an independent engine.
+engine(int pivLen) =>
+    var array<Pat> pats = array.new<Pat>()
+    var array<float> zzP = array.new<float>()
+    var array<int> zzB = array.new<int>()
+    var array<int> zzD = array.new<int>()
+    float ph = ta.pivothigh(high, pivLen, pivLen)
+    float pl = ta.pivotlow(low, pivLen, pivLen)
+    float a14 = ta.atr(14)
+    array<float> evb = array.new<float>(6, na)
+    if barstate.isconfirmed
+        bool zzEvent = false
+        if not na(ph) and not na(pl)
+            // both confirmed on the same bar: keep alternation
+            if zzD.size() > 0 and zzD.last() == 1
+                if addPivot(zzP, zzB, zzD, -1, pl, bar_index - pivLen)
+                    zzEvent := true
+                if addPivot(zzP, zzB, zzD, 1, ph, bar_index - pivLen)
+                    zzEvent := true
+            else
+                if addPivot(zzP, zzB, zzD, 1, ph, bar_index - pivLen)
+                    zzEvent := true
+                if addPivot(zzP, zzB, zzD, -1, pl, bar_index - pivLen)
+                    zzEvent := true
+        else if not na(ph)
+            if addPivot(zzP, zzB, zzD, 1, ph, bar_index - pivLen)
+                zzEvent := true
+        else if not na(pl)
+            if addPivot(zzP, zzB, zzD, -1, pl, bar_index - pivLen)
+                zzEvent := true
+        if zzEvent
+            detectPat(zzP, zzB, zzD, pats, bar_index)
+        updStatus(pats, bar_index, high, low, close, evb)
+    [evb.get(0), evb.get(1), evb.get(2), evb.get(3), evb.get(4), evb.get(5), a14]
+
+// merge three pivot-length engines of one timeframe; the lowest pivot length
+// wins ties (matches the research signal sort). Returns
+// [uT, uPx, uInv, uW, uPL, dT, dPx, dInv, dW, dPL, atr] where *T is the
+// emitting bar's close-time (ms) used chart-side as the freshness stamp.
+engine3(int p1, int p2, int p3) =>
+    [u1, ui1, uw1, d1, di1, dw1, a1] = engine(p1)
+    [u2, ui2, uw2, d2, di2, dw2, a2] = engine(p2)
+    [u3, ui3, uw3, d3, di3, dw3, a3] = engine(p3)
+    float uPx = na
+    float uInv = na
+    float uW = na
+    float uPL = na
+    float dPx = na
+    float dInv = na
+    float dW = na
+    float dPL = na
+    if not na(u1)
+        uPx := u1
+        uInv := ui1
+        uW := uw1
+        uPL := p1
+    else if not na(u2)
+        uPx := u2
+        uInv := ui2
+        uW := uw2
+        uPL := p2
+    else if not na(u3)
+        uPx := u3
+        uInv := ui3
+        uW := uw3
+        uPL := p3
+    if not na(d1)
+        dPx := d1
+        dInv := di1
+        dW := dw1
+        dPL := p1
+    else if not na(d2)
+        dPx := d2
+        dInv := di2
+        dW := dw2
+        dPL := p2
+    else if not na(d3)
+        dPx := d3
+        dInv := di3
+        dW := dw3
+        dPL := p3
+    float ts = float(time_close)
+    [na(uPx) ? float(na) : ts, uPx, uInv, uW, uPL, na(dPx) ? float(na) : ts, dPx, dInv, dW, dPL, a1]
+
+// four-engine variant for the 1h stream
+engine4(int p1, int p2, int p3, int p4) =>
+    [uT, uPx, uInv, uW, uPL, dT, dPx, dInv, dW, dPL, a1] = engine3(p1, p2, p3)
+    [u4, ui4, uw4, d4, di4, dw4, a4] = engine(p4)
+    float uT2 = uT
+    float uPx2 = uPx
+    float uInv2 = uInv
+    float uW2 = uW
+    float uPL2 = uPL
+    float dT2 = dT
+    float dPx2 = dPx
+    float dInv2 = dInv
+    float dW2 = dW
+    float dPL2 = dPL
+    if na(uPx2) and not na(u4)
+        uT2 := float(time_close)
+        uPx2 := u4
+        uInv2 := ui4
+        uW2 := uw4
+        uPL2 := p4
+    if na(dPx2) and not na(d4)
+        dT2 := float(time_close)
+        dPx2 := d4
+        dInv2 := di4
+        dW2 := dw4
+        dPL2 := p4
+    [uT2, uPx2, uInv2, uW2, uPL2, dT2, dPx2, dInv2, dW2, dPL2, a1]
+
+// ═══════════════════════════ Streams & daily gate ═══════════════════════════
+// Order = research priority (4h, 3h, 2h, 6h, 1h, 30m). Only the 4h core is
+// ungated; the rest require the soft daily-trend gate.
+[s1uT, s1uP, s1uI, s1uW, s1uL, s1dT, s1dP, s1dI, s1dW, s1dL, s1A] = request.security(syminfo.tickerid, "240", engine3(6, 7, 8))
+[s2uT, s2uP, s2uI, s2uW, s2uL, s2dT, s2dP, s2dI, s2dW, s2dL, s2A] = request.security(syminfo.tickerid, "180", engine3(10, 12, 14))
+[s3uT, s3uP, s3uI, s3uW, s3uL, s3dT, s3dP, s3dI, s3dW, s3dL, s3A] = request.security(syminfo.tickerid, "120", engine3(10, 12, 14))
+[s4uT, s4uP, s4uI, s4uW, s4uL, s4dT, s4dP, s4dI, s4dW, s4dL, s4A] = request.security(syminfo.tickerid, "360", engine3(4, 5, 6))
+[s5uT, s5uP, s5uI, s5uW, s5uL, s5dT, s5dP, s5dI, s5dW, s5dL, s5A] = request.security(syminfo.tickerid, "60", engine4(8, 10, 12, 14))
+[s6uT, s6uP, s6uI, s6uW, s6uL, s6dT, s6dP, s6dI, s6dW, s6dL, s6A] = request.security(syminfo.tickerid, "30", engine3(20, 24, 28))
+
+// last CLOSED daily bar vs its EMA ± band ATRs → +1 / −1 / 0 (neutral)
+[gC, gE, gA] = request.security(syminfo.tickerid, "D",
+     [close[1], ta.ema(close, gateLen)[1], ta.atr(14)[1]], lookahead = barmerge.lookahead_on)
+int gTrend = na(gC) or na(gE) or na(gA) ? 0 :
+     gC > gE + gateBand * gA ? 1 : gC < gE - gateBand * gA ? -1 : 0
+
+var array<int> blkHours = array.new<int>()
+if barstate.isfirst
+    for s in str.split(str.replace_all(blkStr, " ", ""), ",")
+        float h = str.tonumber(s)
+        if not na(h)
+            blkHours.push(int(h))
+
+float nowT = float(time_close)
+bool blackout = blkHours.includes(hour(time_close, tzIn))
+
+// ═══════════════════════════ Signal selection ═══════════════════════════
+// candidate buffer layout: [score, linePx, invLevel, width, atr, chartBarsPerHTF]
+// score = pivLen*100 + streamOrder, lower wins (research sort: time, piv_len,
+// stream order). Soft gate and blackout filter candidates before the slot.
+consider(bool isLong, float evT, float px, float a, bool gated) =>
+    bool fresh = not na(evT) and evT == nowT and not na(px) and not na(a) and a > 0
+    bool gateOk = not gated or gTrend == 0 or gTrend == (isLong ? 1 : -1)
+    fresh and gateOk and not blackout
+
+tryCand(array<float> buf, bool ok, float pL, int ord, float px, float inv, float w, float a, float k) =>
+    if ok
+        float nScore = pL * 100 + ord
+        if na(buf.get(0)) or nScore < buf.get(0)
+            buf.set(0, nScore)
+            buf.set(1, px)
+            buf.set(2, inv)
+            buf.set(3, w)
+            buf.set(4, a)
+            buf.set(5, k)
+
+array<float> bufL = array.new<float>(6, na)
+array<float> bufS = array.new<float>(6, na)
+
+tryCand(bufL, consider(true, s1uT, s1uP, s1A, false), s1uL, 0, s1uP, s1uI, s1uW, s1A, 8.0)
+tryCand(bufS, consider(false, s1dT, s1dP, s1A, false), s1dL, 0, s1dP, s1dI, s1dW, s1A, 8.0)
+tryCand(bufL, consider(true, s2uT, s2uP, s2A, true), s2uL, 1, s2uP, s2uI, s2uW, s2A, 6.0)
+tryCand(bufS, consider(false, s2dT, s2dP, s2A, true), s2dL, 1, s2dP, s2dI, s2dW, s2A, 6.0)
+tryCand(bufL, consider(true, s3uT, s3uP, s3A, true), s3uL, 2, s3uP, s3uI, s3uW, s3A, 4.0)
+tryCand(bufS, consider(false, s3dT, s3dP, s3A, true), s3dL, 2, s3dP, s3dI, s3dW, s3A, 4.0)
+tryCand(bufL, consider(true, s4uT, s4uP, s4A, true), s4uL, 3, s4uP, s4uI, s4uW, s4A, 12.0)
+tryCand(bufS, consider(false, s4dT, s4dP, s4A, true), s4dL, 3, s4dP, s4dI, s4dW, s4A, 12.0)
+tryCand(bufL, consider(true, s5uT, s5uP, s5A, true), s5uL, 4, s5uP, s5uI, s5uW, s5A, 2.0)
+tryCand(bufS, consider(false, s5dT, s5dP, s5A, true), s5dL, 4, s5dP, s5dI, s5dW, s5A, 2.0)
+tryCand(bufL, consider(true, s6uT, s6uP, s6A, true), s6uL, 5, s6uP, s6uI, s6uW, s6A, 1.0)
+tryCand(bufS, consider(false, s6dT, s6dP, s6A, true), s6dL, 5, s6dP, s6dI, s6dW, s6A, 1.0)
+
+// ═══════════════════════════ Position management ═══════════════════════════
+var float slotStop = na     // current (trailing) stop level
+var float slotUnit = na     // trail unit, fixed at signal time
+var float slotBest = na     // most favorable price seen so far
+var int   slotDead = na     // time-stop chart bar index
+var int   slotDir  = 0
+
+// manage first: the stop active during the NEXT bar uses extremes up to now,
+// mirroring the research engine's prior-extreme trailing convention
+if strategy.position_size != 0
+    if slotDir > 0
+        slotBest := na(slotBest) ? math.max(strategy.position_avg_price, high) : math.max(slotBest, high)
+        slotStop := math.max(slotStop, slotBest - slotUnit)
+        strategy.exit("XL", from_entry = "L", stop = slotStop)
+    else
+        slotBest := na(slotBest) ? math.min(strategy.position_avg_price, low) : math.min(slotBest, low)
+        slotStop := math.min(slotStop, slotBest + slotUnit)
+        strategy.exit("XS", from_entry = "S", stop = slotStop)
+    if not na(slotDead) and bar_index >= slotDead
+        strategy.close_all(comment = "time stop")
+
+float scoreL = bufL.get(0)
+float scoreS = bufS.get(0)
+bool wantLong = dirMode != "Short only" and not na(scoreL)
+bool wantShort = dirMode != "Long only" and not na(scoreS)
+bool placedNow = false
+
+if strategy.position_size == 0 and strategy.opentrades == 0 and (wantLong or wantShort)
+    bool goLong = wantLong and (not wantShort or scoreL <= scoreS)
+    array<float> buf = goLong ? bufL : bufS
+    float lvl = buf.get(1)
+    float inv = buf.get(2)
+    float w = buf.get(3)
+    float aS = buf.get(4)
+    float k = buf.get(5)
+    float raw = goLong ? lvl - inv : inv - lvl
+    if na(raw)
+        raw := stopCap * aS
+    float dist = math.min(math.max(raw, stopFloor * aS), stopCap * aS)
+    float stop = goLong ? lvl - dist : lvl + dist
+    float eqR = strategy.initial_capital + strategy.netprofit
+    float qty = math.floor(eqR * riskPct / 100.0 / (dist * syminfo.pointvalue) / qtyStep) * qtyStep
+    qty := math.min(qty, qtyMax)
+    if qty >= qtyMin and dist > 0
+        slotStop := stop
+        slotUnit := trailMult * aS
+        slotBest := na
+        slotDead := tsMult > 0 ? bar_index + int(math.round(tsMult * w * k)) : int(na)
+        slotDir := goLong ? 1 : -1
+        placedNow := true
+        if goLong
+            strategy.entry("L", strategy.long, qty = qty)
+            strategy.exit("XL", from_entry = "L", stop = slotStop)
+        else
+            strategy.entry("S", strategy.short, qty = qty)
+            strategy.exit("XS", from_entry = "S", stop = slotStop)
+
+if strategy.position_size == 0 and strategy.opentrades == 0 and not placedNow and slotDir != 0
+    slotDir := 0
+    slotStop := na
+    slotUnit := na
+    slotBest := na
+    slotDead := na
+
+// ═══════════════════════════ Minimal visuals ═══════════════════════════
+plot(strategy.position_size != 0 ? slotStop : na, "Trail stop",
+     color.new(color.orange, 0), 2, plot.style_linebr)
+bgcolor(gTrend == 0 ? na : color.new(gTrend > 0 ? #089981 : #f23645, 96),
+     title = "Daily soft-gate trend")

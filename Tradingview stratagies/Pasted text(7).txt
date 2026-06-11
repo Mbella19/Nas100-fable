@@ -1,0 +1,422 @@
+//@version=6
+strategy('PROJECT 1.8 DMI', overlay = true, default_qty_type = strategy.percent_of_equity, default_qty_value = 10, calc_on_every_tick = true, process_orders_on_close = false)
+
+// Input parameters with modern grouping
+var g_breakout = 'Breakout Settings'
+var g_risk = 'Risk Management'
+var g_atr = 'ATR Settings'
+var g_visual = 'Visual Settings'
+var g_alerts = 'PineConnect Alert Settings'
+var g_dmi = 'DMI Filter'
+var g_session = 'Session Settings'
+
+// Breakout settings
+useFirstCandle = input.bool(false, 'Use First 5min Candle Breakout', group = g_breakout)
+pointSize = input.float(1.0, 'Point Size', minval = 0.1, group = g_breakout)
+breakoutPoints = input.float(10, 'Breakout Points', minval = 1, group = g_breakout)
+volumeMultiplier = input.float(1.0, 'Volume Spike Multiplier', minval = 0.0, group = g_breakout)
+useVolumeSpike = input.bool(true, 'Require Volume Spike for Entry', group = g_breakout)
+
+// DMI Settings
+useDMIFilter = input.bool(true, 'Use DMI Filter', group = g_dmi)
+dmiLength = input.int(14, 'DMI Length', group = g_dmi)
+adxSmoothing = input.int(14, 'ADX Smoothing', group = g_dmi)
+minADX = input.float(30, 'Min ADX Value', group = g_dmi)
+
+
+// Risk management settings
+slPoints = input.float(150, 'Stop Loss Points', minval = 1, group = g_risk)
+tpPoints = input.float(750, 'Take Profit Points', minval = 1, group = g_risk)
+trailStartMultiplier = input.float(1.5, 'Trailing Stop Start Multiplier', minval = 0.1, group = g_risk)
+riskPerTrade = input.float(200, 'Risk per trade ($)', minval = 1, group = g_risk)
+pointValue = input.float(1, 'Dollar value per point', minval = 0.01, group = g_risk)
+minContracts = input.float(0.01, 'Minimum contracts', minval = 0.01, step = 0.01, group = g_risk)
+maxTradesPerDay = input.int(2, 'Max trades per day', minval = 1, group = g_risk)
+
+// ATR settings
+atrLength = input.int(5, 'ATR Length', minval = 1, group = g_atr)
+atrMultiplier = input.float(5.0, 'ATR Multiplier', minval = 0.1, group = g_atr)
+tpAtrMultiplier = input.float(15.0, 'ATR Multiplier for Take Profit', minval = 0.1, group = g_atr)
+
+// Visual settings
+showPlots = input.bool(true, 'Show Plot Lines', group = g_visual)
+showTable = input.bool(true, 'Show Info Table', group = g_visual)
+modernColors = input.bool(true, 'Use Modern Color Scheme', group = g_visual)
+
+// PineConnect Alert Settings
+licenseID = input.string('8101758959829', 'License ID', group = g_alerts)
+brokerSymbol = input.string('', 'Broker Symbol (blank = chart)', group = g_alerts)
+sendAlerts = input.bool(true, 'Send Alerts', group = g_alerts)
+alertPrefix = input.string('', 'Alert Prefix (optional)', group = g_alerts)
+
+// Session Settings
+sessionOption = input.string('NYSE (09:30-16:00)', 'Trading Session', options=['NYSE (09:30-16:00)', 'Extended (04:00-20:00)', 'Futures (23:00-22:00)', 'Forex (00:00-24:00)', 'Custom'], group = g_session)
+customSession = input.session('0930-1600', 'Custom Session Time (HHmm-HHmm)', group = g_session, tooltip='Enter custom session hours in format HHmm-HHmm. Example: 0930-1600 for 9:30 AM to 4:00 PM')
+
+// NYC close time check
+nyseCloseHour = 16
+nyseCloseMinute = 0
+
+// Function to check if current time is after NYC close
+isAfterNYCClose() =>
+    h = hour(time_close)
+    m = minute(time_close)
+    (h > nyseCloseHour) or (h == nyseCloseHour and m >= nyseCloseMinute)
+
+// Get session time based on selection
+var string sessionTimes = ''
+if sessionOption == 'NYSE (09:30-16:00)'
+    sessionTimes := '0930-1600'
+else if sessionOption == 'Extended (04:00-20:00)'
+    sessionTimes := '0400-2000'
+else if sessionOption == 'Futures (23:00-22:00)'
+    sessionTimes := '2300-2200:1234567'  // Include weekends for futures
+else if sessionOption == 'Forex (00:00-24:00)'
+    sessionTimes := '0000-0000:1234567'  // 24/7 trading
+else  // Custom
+    sessionTimes := customSession
+
+// Symbol mapping for alerts
+rawSym = brokerSymbol != '' ? brokerSymbol : syminfo.tickerid
+parts = str.split(rawSym, ':')
+outSym = array.size(parts) > 1 ? array.get(parts, 1) : rawSym
+
+// Modern color scheme
+color bullColor = modernColors ? #000000 : color.rgb(0, 0, 0)
+color bearColor = modernColors ? #000000 : color.rgb(0, 0, 0)
+color neutralColor = modernColors ? #546e7a : color.blue
+color highlightColor = modernColors ? #ffab40 : color.yellow
+color bgColor = modernColors ? color.new(#263238, 70) : color.new(color.black, 70)
+color textColor = modernColors ? #eceff1 : color.white
+
+// ATR, DMI and Volume Calculations
+atrValue = ta.atr(atrLength)
+[diPlus, diMinus, adxVal] = ta.dmi(dmiLength, adxSmoothing)
+avgVolume = ta.sma(volume, 14)
+// Session time check
+isInSession = not na(time(timeframe.period, sessionTimes))
+
+// Track current day to detect day change
+var int currentDay = dayofweek(time)
+isNewDay = dayofweek(time) != currentDay
+if isNewDay
+    currentDay := dayofweek(time)
+
+// Determine session start for the current day
+var float sessionOpenTime = na
+if isInSession and (na(sessionOpenTime) or isNewDay)
+    sessionOpenTime := time
+
+// Reset session open time when we're outside the session
+if not isInSession
+    sessionOpenTime := na
+
+// Flag for new session
+isNewSession = not na(sessionOpenTime) and (sessionOpenTime != sessionOpenTime[1] or na(sessionOpenTime[1]))
+
+// Variable declarations
+var float firstCandleHigh = na
+var float firstCandleLow = na
+var bool firstCandleCaptured = false
+var bool entryTaken = false
+var float entryPrice = na
+var int dayStartBarIndex = na
+var int barsSinceOpen = na
+var bool trailActive = false
+var float currentStop = na
+var float currentTakeProfit = na
+var float trailingLevel = na
+var int tradeCountToday = 0
+var float tradeQty = minContracts
+
+// New variables to track signals and stop levels
+var bool longSignalDetected = false
+var bool shortSignalDetected = false
+var float initialStopLevel = na
+var float potentialEntryPrice = na
+
+// Reset variables at the start of each day
+if isNewDay
+    dayStartBarIndex := bar_index
+    firstCandleHigh := na
+    firstCandleLow := na
+    firstCandleCaptured := false
+    entryTaken := false
+    entryPrice := na
+    barsSinceOpen := 0
+    trailActive := false
+    currentStop := na
+    currentTakeProfit := na
+    trailingLevel := na
+    longSignalDetected := false
+    shortSignalDetected := false
+    initialStopLevel := na
+    potentialEntryPrice := na
+    tradeCountToday := 0
+    tradeQty := minContracts
+
+// Count bars since market open for the current day's session
+if isInSession
+    barsSinceOpen := isNewSession ? 0 : barsSinceOpen + 1
+
+// Capture the first candle of the session
+if barsSinceOpen == 0 and isInSession
+    firstCandleHigh := high
+    firstCandleLow := low
+    firstCandleCaptured := true
+
+// Track entry and exit signals for alerts
+var bool longSignal = false
+var bool shortSignal = false
+var bool tpHit = false
+var bool slHit = false
+
+// Reset signal flags
+longSignal := false
+shortSignal := false
+tpHit := false
+slHit := false
+
+// DMI filter conditions
+dmiLongOK = not useDMIFilter or (diPlus > diMinus and adxVal >= minADX)
+dmiShortOK = not useDMIFilter or (diMinus > diPlus and adxVal >= minADX)
+
+
+// Trading logic - detect signals based on mode (with/without first 5min candle)
+if not entryTaken and isInSession and tradeCountToday < maxTradesPerDay and not isAfterNYCClose()
+    // Apply volume spike condition only if useVolumeSpike is true
+    volumeCondition = useVolumeSpike ? volume > avgVolume * volumeMultiplier : true
+    
+    // Define conditions based on whether we use first candle breakouts or not
+    longCondition = false
+    shortCondition = false
+    
+    if useFirstCandle and firstCandleCaptured and barsSinceOpen > 0
+        // Original breakout logic using first candle
+        longCondition := close > firstCandleHigh or high >= firstCandleHigh + breakoutPoints * pointSize
+        shortCondition := close < firstCandleLow or low <= firstCandleLow - breakoutPoints * pointSize
+    else if not useFirstCandle
+        // Alternative logic when not using first candle breakouts
+        // Here we use price action based on DMI for entries
+        longCondition := dmiLongOK and (close > open) and (close > close[1])
+        shortCondition := dmiShortOK and (close < open) and (close < close[1])
+    
+    // Only apply volume condition if it's enabled
+    if useVolumeSpike
+        longCondition := longCondition and volumeCondition
+        shortCondition := shortCondition and volumeCondition
+
+    // Add DMI filter to conditions (this still applies in both modes)
+    longCondition := longCondition and dmiLongOK
+    shortCondition := shortCondition and dmiShortOK
+
+    if longCondition and not longSignalDetected
+        longSignalDetected := true
+        potentialEntryPrice := close
+        initialStopLevel := potentialEntryPrice - atrMultiplier * atrValue // Initial stop for long
+
+    if shortCondition and not shortSignalDetected
+        shortSignalDetected := true
+        potentialEntryPrice := close
+        initialStopLevel := potentialEntryPrice + atrMultiplier * atrValue // Initial stop for short
+
+// Now check for trailing stop activation and enter only when it's active
+if (longSignalDetected or shortSignalDetected) and not entryTaken and tradeCountToday < maxTradesPerDay and not isAfterNYCClose() and isInSession
+    // For long signals
+    if longSignalDetected and dmiLongOK
+        // Check if the trailing stop would be activated (price moved favorably)
+        if high >= potentialEntryPrice + trailStartMultiplier * atrValue
+            // The new trailing stop level would be:
+            newStopLevel = high - atrMultiplier * atrValue
+            // Enter only if the stop has moved from initial level
+            if newStopLevel > initialStopLevel
+                entryPrice := close
+                currentStop := newStopLevel
+                
+                // Calculate position size based on actual entry price and stop level
+                stopDistance = math.abs(entryPrice - currentStop)
+                riskPerPoint = stopDistance > 0 ? riskPerTrade / stopDistance : 0
+                contractsNeeded = riskPerPoint / pointValue
+                
+                // Allow fractional position sizing with minimum of 0.01
+                tradeQty := math.max(minContracts, math.round(contractsNeeded * 100) / 100)
+                
+                strategy.entry('Long', strategy.long, qty=tradeQty)
+                entryTaken := true
+                currentTakeProfit := entryPrice + tpAtrMultiplier * atrValue
+                longSignal := true
+                trailActive := true
+                trailingLevel := newStopLevel
+                tradeCountToday += 1
+                
+                // Send alert for long entry
+                if sendAlerts
+                    alert(alertPrefix + licenseID + ',buy,' + outSym + ',risk=' + str.tostring(tradeQty), alert.freq_once_per_bar_close)
+                
+                // Reset signal flag
+                longSignalDetected := false
+
+    // For short signals
+    else if shortSignalDetected and dmiShortOK
+        // Check if the trailing stop would be activated (price moved favorably)
+        if low <= potentialEntryPrice - trailStartMultiplier * atrValue
+            // The new trailing stop level would be:
+            newStopLevel = low + atrMultiplier * atrValue
+            // Enter only if the stop has moved from initial level
+            if newStopLevel < initialStopLevel
+                entryPrice := close
+                currentStop := newStopLevel
+                
+                // Calculate position size based on actual entry price and stop level
+                stopDistance = math.abs(entryPrice - currentStop)
+                riskPerPoint = stopDistance > 0 ? riskPerTrade / stopDistance : 0
+                contractsNeeded = riskPerPoint / pointValue
+                
+                // Allow fractional position sizing with minimum of 0.01
+                tradeQty := math.max(minContracts, math.round(contractsNeeded * 100) / 100)
+                
+                strategy.entry('Short', strategy.short, qty=tradeQty)
+                entryTaken := true
+                currentTakeProfit := entryPrice - tpAtrMultiplier * atrValue
+                shortSignal := true
+                trailActive := true
+                trailingLevel := newStopLevel
+                tradeCountToday += 1
+                
+                // Send alert for short entry
+                if sendAlerts
+                    alert(alertPrefix + licenseID + ',sell,' + outSym + ',risk=' + str.tostring(tradeQty), alert.freq_once_per_bar_close)
+                
+                // Reset signal flag
+                shortSignalDetected := false
+
+// Continue managing stop loss, take profit, and dynamic trailing stop
+if entryTaken and strategy.position_size != 0
+    // Calculate trailingLevel based on position type
+    if strategy.position_size > 0 // Long position
+        // Trailing is already active from entry condition
+        trailingLevel := high - atrMultiplier * atrValue
+        if trailingLevel > currentStop
+            currentStop := trailingLevel
+    else if strategy.position_size < 0 // Short position
+        // Trailing is already active from entry condition
+        trailingLevel := low + atrMultiplier * atrValue
+        if trailingLevel < currentStop
+            currentStop := trailingLevel
+
+    // Set exit conditions
+    if strategy.position_size > 0
+        strategy.exit('Exit Long', 'Long', stop = currentStop, limit = currentTakeProfit, comment_loss = 'SL Hit', comment_profit = 'TP Hit')
+    else if strategy.position_size < 0
+        strategy.exit('Exit Short', 'Short', stop = currentStop, limit = currentTakeProfit, comment_loss = 'SL Hit', comment_profit = 'TP Hit')
+
+// Detect when a position is closed and send alerts
+if strategy.position_size[1] != 0 and strategy.position_size == 0
+    // Position was closed on this bar
+    if strategy.position_size[1] > 0
+        // Long position was closed
+        if sendAlerts
+            alert(alertPrefix + licenseID + ',closelong,' + outSym + ',qty=' + str.tostring(tradeQty), alert.freq_once_per_bar)
+    else 
+        // Short position was closed
+        if sendAlerts
+            alert(alertPrefix + licenseID + ',closeshort,' + outSym + ',qty=' + str.tostring(tradeQty), alert.freq_once_per_bar)
+
+// Visual elements
+plot(showPlots and useFirstCandle and firstCandleCaptured ? firstCandleHigh : na, 'First 5min High', color = bullColor, linewidth = 2, style = plot.style_line)
+plot(showPlots and useFirstCandle and firstCandleCaptured ? firstCandleLow : na, 'First 5min Low', color = bearColor, linewidth = 2, style = plot.style_line)
+plot(showPlots and entryTaken and strategy.position_size > 0 ? currentTakeProfit : na, 'Long TP', color = color.new(bullColor, 20), style = plot.style_circles, linewidth = 2)
+plot(showPlots and entryTaken and strategy.position_size < 0 ? currentTakeProfit : na, 'Short TP', color = color.new(bullColor, 20), style = plot.style_circles, linewidth = 2)
+plot(showPlots and entryTaken and strategy.position_size != 0 ? currentStop : na, 'Current Stop', color = color.new(bearColor, 20), style = plot.style_circles, linewidth = 2)
+plot(showPlots and longSignalDetected and not entryTaken ? initialStopLevel : na, 'Potential Long Stop', color = color.new(bearColor, 50), style = plot.style_circles, linewidth = 1)
+plot(showPlots and shortSignalDetected and not entryTaken ? initialStopLevel : na, 'Potential Short Stop', color = color.new(bearColor, 50), style = plot.style_circles, linewidth = 1)
+
+// Status table
+if showTable
+    var table infoTable = table.new(position.top_right, 2, 13, bgColor, textColor, 1, color.gray, 1)
+    if barstate.islast
+        table.cell(infoTable, 0, 0, 'STRATEGY MODE', text_color = textColor, bgcolor = neutralColor, text_size = size.small)
+        table.cell(infoTable, 1, 0, useFirstCandle ? 'FIRST 5MIN BREAKOUT' : 'DMI TREND FOLLOW', text_color = highlightColor, bgcolor = bgColor, text_size = size.small)
+        
+        if useFirstCandle
+            table.cell(infoTable, 0, 1, 'FIRST 5MIN CANDLE', text_color = textColor, bgcolor = neutralColor, text_size = size.small)
+            table.cell(infoTable, 1, 1, 'HIGH: ' + str.tostring(firstCandleHigh, '#.##'), text_color = bullColor, bgcolor = bgColor, text_size = size.small)
+            table.cell(infoTable, 0, 2, 'LOW: ' + str.tostring(firstCandleLow, '#.##'), text_color = bearColor, bgcolor = bgColor, text_size = size.small)
+        else
+            table.cell(infoTable, 0, 1, 'TRADING FILTERS', text_color = textColor, bgcolor = neutralColor, text_size = size.small)
+            table.cell(infoTable, 1, 1, 'DMI ONLY', text_color = bullColor, bgcolor = bgColor, text_size = size.small)
+            table.cell(infoTable, 0, 2, 'SIGNAL TYPE', text_color = bearColor, bgcolor = bgColor, text_size = size.small)
+            
+        table.cell(infoTable, 1, 2, 'TRADE STATUS', text_color = textColor, bgcolor = neutralColor, text_size = size.small)
+
+        string statusText = ''
+        if useFirstCandle and firstCandleCaptured or not useFirstCandle
+            if entryTaken
+                if trailActive
+                    statusText := '⟲ TRAILING STOP ACTIVE'
+                else
+                    statusText := '⟳ TRADE ACTIVE'
+            else if longSignalDetected
+                statusText := '⟳ LONG SIGNAL - WAITING FOR TRAILING'
+            else if shortSignalDetected
+                statusText := '⟳ SHORT SIGNAL - WAITING FOR TRAILING'
+            else
+                statusText := '⟳ WAITING FOR SIGNAL'
+        else if useFirstCandle
+            statusText := '⟳ WAITING FOR FIRST CANDLE'
+
+        table.cell(infoTable, 0, 3, statusText, text_color = textColor, bgcolor = bgColor, text_size = size.small)
+
+        if longSignalDetected and not entryTaken
+            table.cell(infoTable, 1, 3, 'POTENTIAL ENTRY: ' + str.tostring(potentialEntryPrice, '#.##'), text_color = highlightColor, bgcolor = bgColor, text_size = size.small)
+            table.cell(infoTable, 0, 4, 'INITIAL STOP: ' + str.tostring(initialStopLevel, '#.##'), text_color = bearColor, bgcolor = bgColor, text_size = size.small)
+        else if shortSignalDetected and not entryTaken
+            table.cell(infoTable, 1, 3, 'POTENTIAL ENTRY: ' + str.tostring(potentialEntryPrice, '#.##'), text_color = highlightColor, bgcolor = bgColor, text_size = size.small)
+            table.cell(infoTable, 0, 4, 'INITIAL STOP: ' + str.tostring(initialStopLevel, '#.##'), text_color = bearColor, bgcolor = bgColor, text_size = size.small)
+        else if entryTaken
+            table.cell(infoTable, 1, 3, 'ENTRY: ' + str.tostring(entryPrice, '#.##'), text_color = highlightColor, bgcolor = bgColor, text_size = size.small)
+            table.cell(infoTable, 0, 4, 'STOP: ' + str.tostring(currentStop, '#.##'), text_color = bearColor, bgcolor = bgColor, text_size = size.small)
+            table.cell(infoTable, 1, 4, 'TP: ' + str.tostring(currentTakeProfit, '#.##'), text_color = bullColor, bgcolor = bgColor, text_size = size.small)
+            var posTypeColor = strategy.position_size > 0 ? bullColor : bearColor
+            var posTypeText = strategy.position_size > 0 ? 'LONG' : 'SHORT'
+            table.cell(infoTable, 0, 5, posTypeText, text_color = posTypeColor, bgcolor = bgColor, text_size = size.small)
+            table.cell(infoTable, 1, 5, 'ATR: ' + str.tostring(atrValue, '#.##'), text_color = textColor, bgcolor = bgColor, text_size = size.small)
+            table.cell(infoTable, 0, 6, 'POSITION SIZE: ' + str.tostring(tradeQty, '#.##'), text_color = textColor, bgcolor = bgColor, text_size = size.small)
+            table.cell(infoTable, 1, 6, 'TRADES TODAY: ' + str.tostring(tradeCountToday) + '/' + str.tostring(maxTradesPerDay), text_color = textColor, bgcolor = bgColor, text_size = size.small)
+            
+            // Show risk calculation 
+            float riskAmount = math.abs(entryPrice - currentStop) * tradeQty * pointValue
+            table.cell(infoTable, 0, 7, 'RISK PER TRADE: $' + str.tostring(riskPerTrade, '#.##'), text_color = textColor, bgcolor = bgColor, text_size = size.small)
+            table.cell(infoTable, 1, 7, 'ACTUAL RISK: $' + str.tostring(riskAmount, '#.##'), text_color = textColor, bgcolor = bgColor, text_size = size.small)
+        
+        // Add DMI values to table
+        if entryTaken
+            table.cell(infoTable, 0, 8, 'DMI STATUS:', text_color = textColor, bgcolor = neutralColor, text_size = size.small)
+            table.cell(infoTable, 1, 8, '+DI: ' + str.tostring(diPlus, '#.##') + ' -DI: ' + str.tostring(diMinus, '#.##'), text_color = textColor, bgcolor = bgColor, text_size = size.small)
+            table.cell(infoTable, 0, 9, 'ADX: ' + str.tostring(adxVal, '#.##'), text_color = textColor, bgcolor = bgColor, text_size = size.small)
+            
+            // Show DMI signal status
+            string dmiSignal = ''
+            if diPlus > diMinus and adxVal >= minADX
+                dmiSignal := '✓ BULLISH DMI'
+            else if diMinus > diPlus and adxVal >= minADX
+                dmiSignal := '✓ BEARISH DMI'
+            else
+                dmiSignal := '✗ NO DMI SIGNAL'
+            
+            table.cell(infoTable, 1, 9, dmiSignal, text_color = str.startswith(dmiSignal, '✓') ? bullColor : bearColor, bgcolor = bgColor, text_size = size.small)
+
+        
+        // Add NYSE close status
+        table.cell(infoTable, 0, 10, 'NYSE CLOSE STATUS:', text_color = textColor, bgcolor = neutralColor, text_size = size.small)
+        table.cell(infoTable, 1, 10, isAfterNYCClose() ? '✗ AFTER NYSE CLOSE - NO TRADES' : '✓ BEFORE NYSE CLOSE', 
+                  text_color = isAfterNYCClose() ? bearColor : bullColor, bgcolor = bgColor, text_size = size.small)
+        
+        // Add day reset information
+        table.cell(infoTable, 0, 11, 'DAY RESET STATUS:', text_color = textColor, bgcolor = neutralColor, text_size = size.small)
+        table.cell(infoTable, 1, 11, 'DAY OF WEEK: ' + str.tostring(currentDay), text_color = textColor, bgcolor = bgColor, text_size = size.small)
+        
+        // Add session time information to table
+        table.cell(infoTable, 0, 12, 'SESSION: ' + sessionOption, text_color = textColor, bgcolor = neutralColor, text_size = size.small)
+        table.cell(infoTable, 1, 12, 'SESSION STATUS: ' + (isInSession ? '✓ IN SESSION' : '✗ OUT OF SESSION'), 
+                  text_color = isInSession ? bullColor : bearColor, bgcolor = bgColor, text_size = size.small)
