@@ -15,6 +15,7 @@ All frames carry:
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -25,6 +26,50 @@ from . import config
 
 NY = ZoneInfo(config.NY_TZ)
 _SESSION_OPEN_HOUR = 1  # server-time session open (18:00 NY)
+
+
+def _fingerprint(df1m: pd.DataFrame) -> dict:
+    """Identity of the input frame a derived cache was built from."""
+    return dict(n=int(len(df1m)),
+                first=int(df1m["srv"].iloc[0].value),
+                last=int(df1m["srv"].iloc[-1].value))
+
+
+def _cache_read(cache: Path, fp: dict, refresh: bool) -> pd.DataFrame | None:
+    """Return the cached frame only if it was built from THIS input (fingerprint
+    sidecar matches). A cache without a sidecar is never trusted."""
+    meta = cache.with_suffix(".meta.json")
+    if refresh or not cache.exists() or not meta.exists():
+        return None
+    try:
+        if json.loads(meta.read_text()) == fp:
+            return pd.read_parquet(cache)
+    except (json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
+def _cache_write(cache: Path, fp: dict, bars: pd.DataFrame, force: bool) -> None:
+    """Persist a derived frame. A narrower input (e.g. a test slice) must never
+    overwrite a cache built from a wider span — that silently poisons every
+    later run. Writes happen when forced (refresh=True), when no provenance
+    exists for a fresh cache, or when the new input spans at least the old one."""
+    meta = cache.with_suffix(".meta.json")
+    if not force:
+        if cache.exists() and not meta.exists():
+            return                               # unknown provenance: don't clobber
+        if meta.exists():
+            try:
+                m = json.loads(meta.read_text())
+            except (json.JSONDecodeError, OSError):
+                return
+            wider = (fp["first"] <= m["first"] and fp["last"] >= m["last"]
+                     and fp["n"] >= m["n"])
+            if not wider:
+                return
+    config.CACHE_DIR.mkdir(exist_ok=True)
+    bars.to_parquet(cache, index=False)
+    meta.write_text(json.dumps(fp))
 
 
 def _read_mt5_csv(path: Path, period: str) -> pd.DataFrame:
@@ -81,8 +126,10 @@ def resample(df1m: pd.DataFrame, minutes: int, anchor: str = "session",
     Bar label = slot start. close_ms = min(slot end, next session open) as epoch ms UTC.
     """
     cache = config.CACHE_DIR / f"m{minutes}_{anchor}.parquet"
-    if cache.exists() and not refresh:
-        return pd.read_parquet(cache)
+    fp = _fingerprint(df1m)
+    hit = _cache_read(cache, fp, refresh)
+    if hit is not None:
+        return hit
 
     day = df1m["srv"].dt.normalize()
     base = day + pd.Timedelta(hours=_SESSION_OPEN_HOUR if anchor == "session" else 0)
@@ -114,15 +161,17 @@ def resample(df1m: pd.DataFrame, minutes: int, anchor: str = "session",
     close_ny = pd.Series(close_srv) - pd.Timedelta(hours=config.SERVER_MINUS_NY_HOURS)
     close_utc = close_ny.dt.tz_localize(NY, nonexistent="shift_forward", ambiguous=True).dt.tz_convert("UTC")
     bars["close_ms"] = close_utc.astype("int64") // 1_000_000
-    bars.to_parquet(cache, index=False)
+    _cache_write(cache, fp, bars, force=refresh)
     return bars
 
 
 def daily(df1m: pd.DataFrame, refresh: bool = False) -> pd.DataFrame:
     """One bar per server-day (= TV daily bar for this symbol, rolling 17:00 NY)."""
     cache = config.CACHE_DIR / "daily.parquet"
-    if cache.exists() and not refresh:
-        return pd.read_parquet(cache)
+    fp = _fingerprint(df1m)
+    hit = _cache_read(cache, fp, refresh)
+    if hit is not None:
+        return hit
     day = df1m["srv"].dt.normalize()
     g = df1m.groupby(day, sort=True)
     bars = pd.DataFrame({
@@ -135,7 +184,7 @@ def daily(df1m: pd.DataFrame, refresh: bool = False) -> pd.DataFrame:
     })
     bars.index.name = "srv_day"
     bars = bars.reset_index()
-    bars.to_parquet(cache, index=False)
+    _cache_write(cache, fp, bars, force=refresh)
     return bars
 
 

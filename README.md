@@ -6,14 +6,21 @@ verified 1:1 logic replicas, plus an RL meta-controller that decides per signal 
 **take / skip / half-size** each strategy's trade. Strategy logic is frozen; the RL only
 gates entries on a shared portfolio account with hard risk caps.
 
-## Results (live-cost basis: measured bid/ask spread included)
+## Results (live-cost basis: measured bid/ask spread included; evaluator corrected 2026-06-11)
 
 | period | RL net / Sharpe | always-take | best individual |
 |---|---|---|---|
-| train 2020-01..2025-05 | $3.55M / 2.51 | $1.27M / 1.39 | $215K / 1.47 |
-| validation 2025-06..12 | $49.8K / 2.02 | $30.5K / 1.09 | $20.1K / 1.44 |
-| locked OOS 2026-01..06 | $60.6K / 2.44 | $43.3K / 1.80 | $15.0K / 2.50 |
-| held-out year combined | $125.5K / 2.15 | $79.6K / 1.34 | $33.5K / 1.06 |
+| train 2020-01..2025-05 | $3.55M / 2.50 | $1.27M / 1.39 | $215K / 1.47 |
+| validation 2025-06..12 † | $48.2K / 1.94 | $29.1K / 1.02 | $18.9K / 1.50 |
+| locked OOS 2026-01..06 | $60.6K / 2.31 | $43.3K / 1.68 | $15.0K / 2.61 |
+| held-out year combined | $119.3K / 2.04 | $73.3K / 1.24 | $33.5K / 1.12 |
+
+† the production ensemble (`deploy_live`) is refit through validation, so its val row is
+partly in-sample. The fit-through-train model (`final_live`), which never saw a bar of
+val/OOS, scores **$95.9K / 1.92** on the combined held-out year — still beating every
+individual strategy on both metrics. Note the net column vs "best individual" partly
+reflects pooling three strategies on one account; the sharper comparison is RL vs
+always-take (same pooled flow): bootstrap P(RL Sharpe > always) = 99.9%.
 
 Verification, Monte Carlo overfitting battery (paired block bootstrap, action-matched
 nulls, deflated Sharpe), data-hygiene table and honest caveats: `nas100_rl/reports/`.
@@ -34,6 +41,8 @@ nas100_rl/
   tests/                  indicator exactness, fill semantics, no-lookahead tests
   reports/                verification + final reports, equity/MC plots
   checkpoints/            trained ensembles (deploy_live = production candidate)
+  live/                   MT5 live runner (windowed replay of the frozen stack,
+                          parity selftest, Wine file-bridge EA, native MT5 gateway)
 ```
 
 ## Reproduce

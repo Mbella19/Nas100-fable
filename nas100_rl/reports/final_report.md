@@ -1,18 +1,27 @@
 # NAS100 RL Meta-Controller — Final Report
 
-**Success gate (user-approved 2026-06-11): beat the best individual strategy on BOTH net profit and Sharpe in train, validation, and the combined held-out year (val + locked OOS): PASSED in all periods.** The stricter per-5-month-window variant passes 5/6 cells (OOS-Sharpe vs a 49-trade S2 hot streak misses: 2.18 vs 2.57); the fold study and the combined-year table below show that cell is luck-dominated.
+**Success gate (user-approved 2026-06-11): beat the best individual strategy on BOTH net profit and Sharpe in train, validation, and the combined held-out year (val + locked OOS): PASSED in all periods.** The stricter per-5-month-window variant passes 5/6 cells (OOS-Sharpe vs a 49-trade S2 hot streak misses: 2.05 vs 2.68); the fold study and the combined-year table below show that cell is luck-dominated.
 
-Grid-selected config: `{'var_penalty': 0.03, 'kl_coef': 0.05, 'score': -0.05390020075815277, 'budget': 25}`. Ensemble of 9 seeds, deterministic mean-logits policy. Locked-OOS evaluations so far: 4.
+Grid-selected config: `{'var_penalty': 0.03, 'kl_coef': 0.05, 'score': -0.05390020075815277, 'budget': 25}`. Ensemble of 9 seeds, deterministic mean-logits policy. Locked-OOS evaluations so far: 6.
+
+> **Evaluator correction (2026-06-11, post-audit):** two accounting defects were fixed —
+> (1) trades still open at a window boundary had their full future PnL credited on the
+> last in-window day *while also* being marked open (double count + boundary lookahead);
+> (2) Sharpe/MaxDD/CAGR ignored the day-0 equity anchor. All tables below are recomputed
+> under the corrected evaluator (typical shift ±0.1 Sharpe; no gate conclusion changed
+> except the already-failing strict OOS-Sharpe cell, whose miss widened from 0.054 to
+> 0.304). Seed-dispersion tables retain pre-correction values (the shift is near-uniform
+> across seeds). This re-evaluation batch is OOS look #6 in `checkpoints/oos_looks.json`.
 
 ## train
 
 | period   | policy    | net       |   sharpe |   maxdd |   calmar |   trades |   win |
 |:---------|:----------|:----------|---------:|--------:|---------:|---------:|------:|
-| train    | solo_s2   | 222,004   |     1.58 |     8.5 |     2.77 |      529 |  38.6 |
-| train    | solo_dmi  | 275,578   |     1.34 |    17.8 |     1.51 |     1339 |  41.3 |
+| train    | solo_s2   | 222,004   |     1.58 |     8.5 |     2.76 |      529 |  38.6 |
+| train    | solo_dmi  | 275,578   |     1.33 |    17.8 |     1.51 |     1339 |  41.3 |
 | train    | solo_cpmt | 182,026   |     0.78 |    24.1 |     0.85 |      389 |  38   |
 | train    | always    | 1,724,246 |     1.58 |    23.3 |     2.95 |     2257 |  40.1 |
-| train    | rl        | 4,170,146 |     2.31 |    21.5 |     4.49 |     2040 |  42.3 |
+| train    | rl        | 4,170,146 |     2.31 |    21.5 |     4.50 |     2040 |  42.3 |
 
 Gate: net PASS, sharpe PASS
 
@@ -42,11 +51,11 @@ Seed dispersion:
 
 | period   | policy    | net    |   sharpe |   maxdd |   calmar |   trades |   win |
 |:---------|:----------|:-------|---------:|--------:|---------:|---------:|------:|
-| val      | solo_s2   | 478    |     0.14 |     6.3 |     0.13 |       83 |  28.9 |
-| val      | solo_dmi  | 19,229 |     0.94 |    25.1 |     1.36 |      138 |  48.6 |
-| val      | solo_cpmt | 20,624 |     1.48 |     8.9 |     4.12 |       34 |  55.9 |
-| val      | always    | 38,104 |     1.35 |    28.9 |     2.47 |      255 |  43.1 |
-| val      | rl        | 50,101 |     1.99 |    21.3 |     4.55 |      242 |  43.8 |
+| val      | solo_s2   | 478    |     0.06 |     6.9 |     0.12 |       83 |  28.9 |
+| val      | solo_dmi  | 19,229 |     0.85 |    26.3 |     1.30 |      138 |  48.6 |
+| val      | solo_cpmt | 19,381 |     1.54 |     8.9 |     3.87 |       34 |  55.9 |
+| val      | always    | 36,622 |     1.28 |    28.9 |     2.36 |      255 |  43.1 |
+| val      | rl        | 48,495 |     1.90 |    21.3 |     4.39 |      242 |  43.8 |
 
 Gate: net PASS, sharpe PASS
 
@@ -76,11 +85,11 @@ Seed dispersion:
 
 | period   | policy    | net    |   sharpe |   maxdd |   calmar |   trades |   win |
 |:---------|:----------|:-------|---------:|--------:|---------:|---------:|------:|
-| oos      | solo_s2   | 15,533 |     2.57 |     5.2 |     7.24 |       49 |  53.1 |
-| oos      | solo_dmi  | 14,238 |     1.03 |    13   |     2.66 |      106 |  42.5 |
-| oos      | solo_cpmt | 13,800 |     1.15 |    12.4 |     2.69 |       32 |  37.5 |
-| oos      | always    | 47,952 |     1.97 |    14.2 |     9.82 |      187 |  44.4 |
-| oos      | rl        | 53,057 |     2.18 |    13.9 |    11.38 |      181 |  44.8 |
+| oos      | solo_s2   | 15,533 |     2.68 |     5.2 |     7.31 |       49 |  53.1 |
+| oos      | solo_dmi  | 14,238 |     0.98 |    13   |     2.66 |      106 |  42.5 |
+| oos      | solo_cpmt | 13,800 |     0.96 |    14.5 |     2.30 |       32 |  37.5 |
+| oos      | always    | 47,952 |     1.84 |    14.2 |     9.83 |      187 |  44.4 |
+| oos      | rl        | 53,057 |     2.05 |    13.9 |    11.39 |      181 |  44.8 |
 
 Gate: net PASS, sharpe FAIL
 
@@ -108,27 +117,46 @@ Seed dispersion:
 
 ## Negative controls (validation period)
 
-- RL: net 50,101, Sharpe 1.99
-- Random gate @ same take-rate (94.9%, 20 seeds): net 37,138, Sharpe 1.35
-- RL on permuted features: net 50,340, Sharpe 1.92
+*Corrected 2026-06-11.* The original section reported a SINGLE feature-permutation draw
+(net 50,340 / Sharpe 1.92) which by luck landed ~2 sigma above its own null and could be
+misread as "the features do nothing". Two fixes: (a) a proper 20-draw permutation null;
+(b) channel ablations closing a blind spot — `SignalEnv._obs` appends 4 live portfolio
+features AFTER the feature matrix, so permuting `feats` never touched portfolio state.
+Numbers below: production ensemble (`deploy_live`, live basis), corrected evaluator.
+
+- RL: net 48,233, Sharpe 1.94 (take-rate 91.8%)
+- Random gate @ same take-rate (20 seeds): net 25,489, Sharpe 0.95 ± 0.28
+- Permutation null (20 draws, signal features shuffled, portfolio state real):
+  net 24,447, Sharpe 0.97 ± 0.45 → RL z = 2.14
+- Ablation, signal features only (portfolio state zeroed): net 47,071, Sharpe 1.91
+- Ablation, portfolio state only (signal features zeroed): net 43,928, Sharpe 1.68
+
+Reading: shuffling the per-signal features destroys the edge (the control behaves), and
+either input channel ALONE retains most of it. The policy learned one robust behavior —
+de-risk in adverse states — redundantly encoded in the market-regime features and the
+portfolio state. On the fit-through-train model (`final_live`, for which validation is
+genuinely unseen) the portfolio-state-only restriction alone scored Sharpe 2.02 vs the
+full policy's 1.67 (signal-only 1.71), i.e. the state channel is the most robust
+expression of the edge out-of-sample; "per-signal alpha picker" would overstate what
+generalizes.
 
 ![equity curves](rl_equity_curves.png)
 
 
 ## Combined held-out year (validation + locked OOS, 2025-06 .. 2026-06)
 
-The strict per-period gate fails ONE cell: OOS Sharpe 2.179 vs S2-solo 2.571. Over the full
-held-out year the picture reverses decisively (S2's hot streak mean-reverts to 1.167):
+The strict per-period gate fails ONE cell: OOS Sharpe 2.048 vs S2-solo 2.684. Over the full
+held-out year the picture reverses decisively (S2's hot streak mean-reverts to 1.115):
 
 | policy    | net     |   sharpe |   maxdd |   trades |
 |:----------|:--------|---------:|--------:|---------:|
-| rl        | 113,489 |    1.97  |   0.213 |      424 |
-| always    | 94,379  |    1.559 |   0.289 |      442 |
-| solo_s2   | 16,085  |    1.167 |   0.063 |      132 |
-| solo_dmi  | 33,467  |    0.951 |   0.251 |      244 |
-| solo_cpmt | 34,582  |    1.087 |   0.16  |       66 |
+| rl        | 107,247 |    1.863 |   0.213 |      424 |
+| always    | 88,137  |    1.460 |   0.289 |      442 |
+| solo_s2   | 16,085  |    1.115 |   0.069 |      132 |
+| solo_dmi  | 27,224  |    0.750 |   0.263 |      244 |
+| solo_cpmt | 34,582  |    1.157 |   0.160 |       66 |
 
-RL beats the best solo on net (113,489 vs 34,582) AND Sharpe (1.970 vs 1.167) over the
+RL beats the best solo on net (107,247 vs 34,582) AND Sharpe (1.863 vs 1.157) over the
 combined held-out year.
 
 ## Honesty addendum: why iteration on the locked OOS was stopped
@@ -137,9 +165,11 @@ A 6-fold walk-forward study with gate-geometry (~5-month) windows measured the e
 Sharpe margin of the best learnable policy over the best-solo benchmark at ~0 (-0.05 mean,
 fold-to-fold swings of +/-1.0): in short windows, "the best of three strategies" is a max
 over noisy draws and is luck-inflated (one fold's best solo hit 3.68). Re-rolling new
-candidates against the same locked 5-month OOS until one clears 2.571 would constitute
+candidates against the same locked 5-month OOS until one clears 2.684 would constitute
 selection on OOS — the overfitting this project was mandated to avoid. Iteration was
-therefore stopped after 3 candidate evaluations, all logged below:
+therefore stopped after 3 candidate evaluations (snapshot below; the audit file now also
+records look #5, the live-cost retrain report, and look #6, the post-audit corrected
+re-evaluation batch):
 
 [
   {
@@ -166,29 +196,29 @@ ensemble was pre-committed and post-hoc seed selection was not done, for the sam
 
 ## Monte Carlo overfitting assessment (deployed ensemble, held-out year)
 
-**A) Paired stationary block bootstrap** (10,000 draws, mean block 10 days, 262 held-out days,
-identical day-blocks across policies):
-- RL Sharpe 5/50/95%: 0.63 / 1.98 / 3.21; return 26% / 114% / 259%; MaxDD 11.5% / 17.8% / 29.1%.
-- P(RL Sharpe > best solo of that draw) = 61.9% (median diff +0.18, 90% CI [-1.01, +1.00]).
-- P(RL return > best solo) = 90.8%.
-- **P(RL Sharpe > always-take) = 96.9%** and P(return > always-take) = 81.6% — the learned
+**A) Paired stationary block bootstrap** (10,000 draws, mean block 10 days, 263 held-out days,
+identical day-blocks across policies; corrected evaluator):
+- RL Sharpe 5/50/95%: 0.54 / 1.87 / 3.14; return 22% / 108% / 249%; MaxDD 12.1% / 18.5% / 29.9%.
+- P(RL Sharpe > best solo of that draw) = 55.6% (median diff +0.09, 90% CI [-1.08, +0.95]).
+- P(RL return > best solo) = 87.4%.
+- **P(RL Sharpe > always-take) = 96.6%** and P(return > always-take) = 82.3% — the learned
   overlay's improvement over taking every signal is robust under resampling.
 
 **B) Action-matched random-policy null** (random policies reproducing the RL's per-strategy
 action frequencies; 2,000 draws held-out, 1,000 train):
-- Held-out: RL Sharpe 1.970 vs null 1.537±0.194 -> **99.2 percentile, z = 2.23** (net: 96.9 pct).
-- Train: z = 6.96 (100 pct). The in-sample -> held-out attenuation (7 -> 2.2) is normal
+- Held-out: RL Sharpe 1.863 vs null 1.438±0.197 -> **99.1 percentile, z = 2.15** (net: 96.8 pct).
+- Train: z = 6.95 (100 pct). The in-sample -> held-out attenuation (7 -> 2.2) is normal
   shrinkage; an overfit selector would sit near the 50th percentile held-out, not the 99th.
 
-**C) Deflated Sharpe Ratio** (Bailey & Lopez de Prado; trials = 4 logged OOS evaluations,
-fat-tail corrected: skew 1.76, kurtosis 9.4): RL annual SR 1.97 vs deflated hurdle 2.10 above
-the best-solo benchmark -> P(skill vs best-solo) = 44%.
+**C) Deflated Sharpe Ratio** (Bailey & Lopez de Prado; trials = 6 logged OOS evaluations,
+fat-tail corrected: skew 1.70, kurtosis 9.3): RL annual SR 1.86 vs deflated hurdle 2.32 above
+the best-solo benchmark -> P(skill vs best-solo) = 31%.
 
-**Verdict:** the selection skill itself is statistically real out-of-sample (B: p≈0.008 vs
-chance; A: 96.9% vs always-take) — the model is NOT overfit in the damaging sense. The
+**Verdict:** the selection skill itself is statistically real out-of-sample (B: p≈0.009 vs
+chance; A: 96.6% vs always-take) — the model is NOT overfit in the damaging sense. The
 specific claim "higher Sharpe than the best individual strategy" is supported in median but
-not proven at one held-out-year horizon (61.9% bootstrap; DSR 44% after multiplicity and
-fat-tail penalties) — the net-profit superiority is robust (90.8%). More held-out history
+not proven at one held-out-year horizon (55.6% bootstrap; DSR 31% after multiplicity and
+fat-tail penalties) — the net-profit superiority is robust (87.4%). More held-out history
 would be required to prove the Sharpe leg at conventional significance.
 
 ![monte carlo](montecarlo.png)
@@ -201,28 +231,32 @@ The ensemble was retrained end-to-end on the live-cost basis: measured bid/ask s
 every trade's per-contract PnL; rolling-performance features recomputed on the adjusted
 stream; hyperparameters re-gridded (config kappa=0.08, kl=0.05, budget 27); recipe gated on
 validation (Sharpe 1.758 vs best solo 1.437; median seed 1.612 PASS; 96th pct of 50-draw
-null), then refit through end-of-validation. All numbers below INCLUDE live spread costs.
+null — selection-time figures under the pre-correction evaluator), then refit through
+end-of-validation. All numbers below INCLUDE live spread costs (corrected evaluator).
 
 | period | RL net / Sharpe / MaxDD | always-take | best solo |
 |---|---|---|---|
-| train | 3,551,626 / 2.51 / 17.7% | 1,265,136 / 1.39 | 214,884 / 1.47 |
-| val | 49,830 / 2.02 / 18.9% | 30,477 / 1.09 | 20,114 / 1.44 |
-| locked OOS | 60,624 / 2.44 / 14.3% | 43,292 / 1.80 | 15,039 / 2.50* |
-| held-out year | 125,491 / 2.15 / 18.9% | 79,560 / 1.34 | 33,509 / 1.06 |
+| train | 3,551,626 / 2.50 / 17.7% | 1,265,136 / 1.39 | 214,884 / 1.47 |
+| val | 48,233 / 1.94 / 18.9% | 29,080 / 1.02 | 18,884 / 1.50 |
+| locked OOS | 60,624 / 2.31 / 14.3% | 43,292 / 1.68 | 15,039 / 2.61* |
+| held-out year | 119,259 / 2.04 / 18.9% | 73,328 / 1.24 | 33,509 / 1.12 |
 
-*OOS Sharpe misses S2's hot streak by 0.054 (2.443 vs 2.497); per protocol no further
-candidates were rolled against the locked window (OOS looks: 5, all logged).
-**User-approved gate (combined held-out year): PASSED — net 125,491 vs 33,509 and
-Sharpe 2.149 vs 1.057.** Cost-aware training made the policy more selective (train
+*OOS Sharpe misses S2's hot streak by 0.304 (2.306 vs 2.610). Pre-correction the miss was
+0.054 — a margin that sat inside the boundary-accounting bug's blast radius, exactly as the
+audit warned; the correction moved it against the RL. Per protocol no further candidates
+were rolled against the locked window (OOS looks: 6, all logged).
+**User-approved gate (combined held-out year): PASSED — net 119,259 vs 33,509 and
+Sharpe 2.043 vs 1.124.** Cost-aware training made the policy more selective (train
 take-rate 76%: skips 31% of CPMT, 28% of DMI, 8% of S2) and it outperforms the
 zero-cost-trained model even before costs.
 
-Monte Carlo (live costs, held-out year): bootstrap P(Sharpe>best solo)=76.3%,
-P(return>best solo)=95.1%, P(Sharpe>always)=99.8%; RL Sharpe 5/50/95% = 0.82/2.16/3.36,
-MaxDD 11.5/16.8/27.0%; action-matched null z=3.14 (100th pct of 2,000); deflated Sharpe
-2.15 vs multiplicity-adjusted hurdle 2.10 (P(skill)=52%). Selection skill confirmed real
-under live frictions; the Sharpe-vs-best-solo margin remains suggestive (76%) rather than
-proven at the one-year horizon.
+Monte Carlo (live costs, held-out year, corrected evaluator): bootstrap
+P(Sharpe>best solo)=70.3%, P(return>best solo)=93.0%, P(Sharpe>always)=99.9%,
+P(return>always)=95.8%; RL Sharpe 5/50/95% = 0.75/2.05/3.28, MaxDD 11.8/17.6/27.9%;
+action-matched null z=3.07 held-out (100th pct of 2,000; train z=7.58); deflated Sharpe
+2.04 vs multiplicity-adjusted hurdle 2.27 at trials=6 (P(skill vs best solo)=40%).
+Selection skill confirmed real under live frictions; the Sharpe-vs-best-solo margin
+remains suggestive (70%) rather than proven at the one-year horizon.
 
 
 ## Data-hygiene summary (what trained on what)
@@ -238,10 +272,11 @@ from the FROZEN verified strategies (no fitted parameters).
 
 Cleanest single result — the fit-through-TRAIN model (`final_live`), which never trained
 on one bar of validation or OOS, evaluated on the fully untouched held-out year under
-live costs: **net 102,173 / Sharpe 2.030 / MaxDD 18.9%** vs best solo 33,509 / 1.057 —
-gate PASSED on completely unseen data. (Its OOS-only Sharpe: 2.418, vs the deploy
-refit's 2.443 — the val refit adds recency, not the result.)
+live costs: **net 95,941 / Sharpe 1.922 / MaxDD 18.9%** vs best solo 33,509 / 1.124 —
+gate PASSED on completely unseen data. (Its OOS-only Sharpe: 2.343 vs the deploy
+refit's 2.306 — after the evaluator correction the never-saw-val model actually edges
+the refit on OOS; the val refit adds recency, not the result.)
 
 Residual honesty notes: validation was used for model SELECTION (its designed role), and
-the 5 OOS evaluations are a mild multiple-testing exposure — penalized explicitly in the
-deflated-Sharpe test (trials=5), which the model clears.
+the 6 OOS evaluations are a mild multiple-testing exposure — penalized explicitly in the
+deflated-Sharpe test (trials=6).

@@ -39,7 +39,7 @@ def daily_returns(world: dict, i0: int, i1: int, policy) -> tuple[np.ndarray, pd
     ms_lo = int(world["sig"]["signal_ms"].iloc[i0])
     ms_hi = int(world["sig"]["signal_ms"].iloc[i1 - 1])
     curve = ev.daily_curve_range(res["ledger"], world["sig"], world["days"], ms_lo, ms_hi, env.e0)
-    eq = curve["equity"].to_numpy()
+    eq = np.concatenate([[env.e0], curve["equity"].to_numpy()])   # day-0 anchor
     return np.diff(np.log(np.maximum(eq, 1e-9))), curve
 
 

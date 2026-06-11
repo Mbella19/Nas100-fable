@@ -18,5 +18,9 @@
   {
     "tag": "live_cost_retrain_deploy",
     "ts": "2026-06-11T06:37:36.543632+00:00"
+  },
+  {
+    "tag": "audit_fix_curve_rerun_gate_mc_batch",
+    "ts": "2026-06-11T07:57:34.169519+00:00"
   }
 ]

@@ -28,7 +28,8 @@ TV_XLSX = {
 }
 
 # MT5 server time = New York time + 7 hours, year-round (NY-close-at-midnight broker
-# convention; validated in tests/test_data.py against session volume patterns).
+# convention; validated against the data by data.validate(): session-open hours,
+# weekday set, NYSE-open volume spike at 09:30 NY summer AND winter).
 SERVER_MINUS_NY_HOURS = 7
 NY_TZ = "America/New_York"
 
@@ -130,4 +131,32 @@ RL = dict(
     # de-risk-only action space: upsizing proved Sharpe-neutral but drawdown-positive
     # (Sharpe is leverage-invariant), and Sharpe is the binding gate metric
     action_multipliers=(0.0, 0.5, 1.0),
+)
+
+# ---------------------------------------------------------------------------
+# Live runner (MT5 execution; the verified Python stack stays the brain)
+# ---------------------------------------------------------------------------
+LIVE = dict(
+    symbol="NAS100",
+    ensemble_tag="deploy_live",          # 9-seed mean-logits ensemble, never one seed
+    # model account runs at 100k scale (training distribution); broker lots =
+    # model_qty / usd_per_point_per_lot * risk_scale (0.1 => trade a 10k-like account)
+    risk_scale=0.10,
+    usd_per_point_per_lot=1.0,           # fallback; overridden by broker symbol spec
+    lot_step=0.01,
+    min_lot=0.01,
+    magic={"s2": 771001, "dmi": 771002, "cpmt": 771003},
+    # windowed-replay spans: long enough for bit-convergent indicators + all
+    # path-dependent state (positions, day-state, pattern buffers); parity is
+    # asserted against the frozen signal stream by `runner --selftest`
+    s2_window_days=12,                   # holds <1 session; ATR14@5m converges <2d
+    dmi_window_days=7,                   # holds p99 0.2d; RMA14@1m converges <1d
+    cpmt_anchor="2023-01-03",            # fixed anchor: daily ATR14 RMA needs ~490 daily bars
+    feature_window_days=420,             # 30m features: ema100/atr-regime convergence
+    bridge_dir=("/Users/gervaciusjr/Library/Application Support/"
+                "net.metaquotes.wine.metatrader5/drive_c/Program Files/"
+                "MetaTrader 5/MQL5/Files"),  # FileBridgeGateway dir (MT5-under-Wine)
+    live_store="live_m1.parquet",        # collector append target in CACHE_DIR
+    journal="live_journal.jsonl",        # every decision/order/fill, append-only
+    poll_seconds=2.0,
 )

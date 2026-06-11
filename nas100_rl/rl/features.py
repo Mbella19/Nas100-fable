@@ -7,7 +7,9 @@ decision time (the signal bar's close):
 - per-strategy rolling performance uses mechanical trades with exit_ms <= signal_ms;
 - normalization stats (z-score) are fit on TRAIN-period rows only.
 
-A truncation test (tests/test_core.py) asserts the no-lookahead property.
+Strategy-level truncation tests live in tests/test_core.py (S2/CPMT); feature-level
+causality is additionally cross-checked by the live runner's parity selftest, which
+recomputes features incrementally and compares to this module's cached matrix.
 """
 from __future__ import annotations
 

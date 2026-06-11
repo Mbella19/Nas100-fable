@@ -14,7 +14,7 @@ from . import features as featmod
 from . import signals as sigmod
 from .env import SignalEnv, run_fixed_policy
 
-A_SKIP, A_HALF, A_FULL, A_LARGE = 0, 1, 2, 3
+A_SKIP, A_HALF, A_FULL = 0, 1, 2
 
 
 def load_all(basis: str = "tv"):
@@ -67,8 +67,8 @@ def _curve(ledger: pd.DataFrame, sig: pd.DataFrame, dd: pd.DataFrame,
             k_out = int(np.searchsorted(ends, r.exit_ms, side="left"))
             if k_out < nd:
                 cash_delta[k_out] += r.pnl
-            elif nd > 0:
-                cash_delta[nd - 1] += r.pnl
+            # trades exiting after the window stay marked-to-market through the
+            # last day; realized PnL is credited only when the exit is in-window
             for k in range(k_in, min(k_out, nd)):
                 eq_mark[k] += r.qty * (closes[k] - r.entry_price) * r.direction
     equity = equity0 + np.cumsum(cash_delta) + eq_mark
@@ -76,7 +76,8 @@ def _curve(ledger: pd.DataFrame, sig: pd.DataFrame, dd: pd.DataFrame,
 
 
 def metrics(curve: pd.DataFrame, equity0: float) -> dict:
-    eq = curve["equity"].to_numpy()
+    # day-0 anchor at equity0 so the first day's return/drawdown is counted
+    eq = np.concatenate([[equity0], curve["equity"].to_numpy()])
     if len(eq) < 2:
         return dict(net=0.0, sharpe=0.0, maxdd=0.0, calmar=0.0, cagr=0.0)
     r = np.diff(np.log(np.maximum(eq, 1e-9)))
@@ -85,7 +86,7 @@ def metrics(curve: pd.DataFrame, equity0: float) -> dict:
     peak = np.maximum.accumulate(eq)
     dd = (peak - eq) / peak
     maxdd = float(dd.max())
-    years = len(eq) / 252.0
+    years = (len(eq) - 1) / 252.0
     cagr = float((eq[-1] / equity0) ** (1 / years) - 1) if years > 0 and eq[-1] > 0 else -1.0
     calmar = cagr / maxdd if maxdd > 1e-9 else 0.0
     return dict(net=float(eq[-1] - equity0), sharpe=sharpe, maxdd=maxdd,
