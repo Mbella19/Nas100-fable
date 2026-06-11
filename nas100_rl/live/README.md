@@ -54,9 +54,19 @@ python3 -m nas100_rl.live.runner --live --gateway mt5
   push the policy out of its training distribution.
 - **Quirks ship as-is.** DMI's frozen overnight stops, S2's risk floor etc. are
   part of the verified behavior; "fixing" them live destroys parity.
-- After downtime just restart: bars backfill, copy-trading semantics make the
-  mechanical stream self-healing; server-side SL/TP protect open positions
-  while the bot is dark.
+- **Hedging account required.** Up to three positions (plus a DMI reversal
+  overlap, where the new leg opens ~1 bar before the old leg's close event)
+  coexist on one symbol as separate tickets. An MT5 *netting* account would
+  merge them and corrupt the per-ticket bookkeeping. The EA stamps every runner
+  order with magic `771000` so they are distinguishable from manual trades or
+  other EAs on the account (a dedicated account is still cleaner).
+- After downtime just restart: the runner heals missing bars from the
+  gateway's backlog (EA backfill / MT5 history; any unhealable hole is
+  journaled as `gap_warning`), restores the model account, halt flag and open
+  broker tickets from `data_cache/live_state.json`, and the engines emit any
+  closures that happened while it was dark (server-side SL/TP protected the
+  positions meanwhile). Delete `live_state.json` only if you deliberately want
+  a fresh 100k model account with no memory.
 
 ## Known, accepted live-vs-backtest gaps (measure in reconciliation)
 
@@ -64,7 +74,26 @@ python3 -m nas100_rl.live.runner --live --gateway mt5
   executed by the bot at the close of the 1-min/30-min bar that triggered them
   (the backtest fills at the level inside the bar). Initial SL (and DMI TP) are
   server-side at exact levels, so stop-outs before any trail ratchet are
-  parity-exact. S2's stop never trails -> S2 exits are parity-exact.
+  parity-exact. S2's *stop* exits are parity-exact (static, server-side); its
+  time-based force-exits are bot-executed and carry the latency below.
+- **+1 chart-minute entry/exit latency on S2 and CPMT.** A 5m/30m slot is only
+  known complete when the next slot's first 1-min bar closes, so broker orders
+  fire ~60-65s after the mechanical fill moment (measured: mechanical 17:35:00
+  vs broker fill 17:36:04). DMI (1-min chart) is ~2-4s. Systematic, adverse on
+  average for momentum entries — part of the reconciliation budget.
+- **Closure-detection lag in the model account.** SignalEnv settles an exit at
+  its exact minute; live, the exit is only known when the chart bar completes
+  (worst case ~31 min for CPMT). A decision falling inside that window sees
+  slightly stale portfolio state (open count/risk/equity marks). Same root
+  cause as the entry latency.
+- **Open-trade marks use broker fill prices** (0 while the fill is in flight)
+  rather than the mechanical entry price; realized PnL is always mechanical,
+  so the deviation never compounds.
+- **DMI's server-side SL/TP are live during the entry bar**, while the verified
+  mechanical behavior has no exit active until the entry bar closes. A 5xATR
+  (SL) / 15xATR (TP) touch within that first minute closes the broker position
+  but not the model's; the later bot close fails (journaled `ok=False`) and the
+  broker-vs-model PnL gap shows in reconciliation. Rare but real.
 - Financing/swap and weekend rollover are NOT in the backtest basis (~4%/yr of
   account at always-take exposure; the RL's skips reduce it). Expect live to
   run below backtest by roughly this.

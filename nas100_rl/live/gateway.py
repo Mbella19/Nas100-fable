@@ -36,6 +36,12 @@ class BaseGateway:
     (srv, open, high, low, close, volume, spread)."""
 
     def poll_bars(self) -> pd.DataFrame: raise NotImplementedError
+    def backlog(self) -> pd.DataFrame:
+        """One-shot historical bars available at startup (e.g. the EA's bars.csv
+        backfill), used by the runner to heal gaps in its stored history BEFORE
+        the live loop starts. Must leave the steady-state poll cursor at the
+        live edge. Default: nothing available."""
+        return pd.DataFrame()
     def account_equity(self) -> float | None: return None
     def symbol_spec(self) -> dict: return {}
     def market_order(self, side: int, lots: float, sl: float | None,
@@ -132,6 +138,11 @@ class FileBridgeGateway(BaseGateway):
         self._cmd_id = int(time.time())
         self._acks: dict[str, dict] = {}
 
+    def backlog(self) -> pd.DataFrame:
+        # first read of bars.csv from offset 0 = the EA's full backfill plus
+        # everything appended since; poll cursor lands at the live edge
+        return self.poll_bars()
+
     def poll_bars(self) -> pd.DataFrame:
         if not self.bars_path.exists():
             return pd.DataFrame()
@@ -225,9 +236,16 @@ class Mt5Gateway(BaseGateway):
             raise RuntimeError(f"symbol_select({symbol}) failed")
         self._last_srv: pd.Timestamp | None = None
 
+    def backlog(self) -> pd.DataFrame:
+        # deep history for startup gap-healing (~2.5 weeks of sessions)
+        return self._closed_rates(20_000)
+
     def poll_bars(self) -> pd.DataFrame:
+        return self._closed_rates(3_000)
+
+    def _closed_rates(self, count: int) -> pd.DataFrame:
         mt5 = self.mt5
-        rates = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M1, 0, 3000)
+        rates = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M1, 0, count)
         if rates is None or len(rates) < 2:
             return pd.DataFrame()
         df = pd.DataFrame(rates[:-1])              # drop the forming bar

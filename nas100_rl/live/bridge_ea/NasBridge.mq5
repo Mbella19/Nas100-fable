@@ -20,15 +20,19 @@
 
 input string  InpSymbol      = "NAS100";
 input int     InpTimerMs     = 1000;
-input int     InpBackfill    = 5000;     // bars exported on first run
+input int     InpBackfill    = 20000;    // bars exported on first run (~2.5 weeks;
+                                         // sized so the runner can heal outage gaps)
+input long    InpMagic       = 771000;   // stamps every runner order (vs manual/other EAs)
 
 CTrade  trade;
 datetime g_last_bar = 0;
 long     g_cmd_offset = 0;
+bool     g_cmd_synced = false;           // becomes true after skipping the backlog
 
 int OnInit()
 {
    SymbolSelect(InpSymbol, true);
+   trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(50);
    WriteSpec();
    EventSetMillisecondTimer(InpTimerMs);
@@ -110,9 +114,34 @@ void Ack(string id, bool ok, string ticket, double price, string msg)
 
 void ProcessCommands()
 {
+   // NEVER replay the pre-restart backlog: commands.csv survives terminal/EA
+   // restarts, and re-executing old opens would fire duplicate market orders.
+   // On the first tick after (re)start, skip exactly to the end of whatever
+   // already exists; only commands appended after that point are executed.
+   // (Stale commands must not run late anyway — the runner stops waiting for
+   // their acks after 10s and has already journaled them as failed.)
+   if(!g_cmd_synced)
+   {
+      if(FileIsExist("commands.csv"))
+      {
+         int hs = FileOpen("commands.csv", FILE_READ|FILE_TXT|FILE_ANSI);
+         if(hs == INVALID_HANDLE) return;          // retry next tick
+         FileSeek(hs, 0, SEEK_END);
+         g_cmd_offset = FileTell(hs);
+         FileClose(hs);
+      }
+      else
+         g_cmd_offset = 0;                         // nothing to skip
+      g_cmd_synced = true;
+      return;
+   }
    if(!FileIsExist("commands.csv")) return;
    int h = FileOpen("commands.csv", FILE_READ|FILE_TXT|FILE_ANSI);
    if(h == INVALID_HANDLE) return;
+   FileSeek(h, 0, SEEK_END);
+   long fsize = FileTell(h);
+   if(fsize < g_cmd_offset) g_cmd_offset = 0;   // truncated/recreated file:
+                                                // its content is all new
    FileSeek(h, g_cmd_offset, SEEK_SET);
    while(!FileIsEnding(h))
    {

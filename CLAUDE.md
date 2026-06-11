@@ -44,9 +44,10 @@ through the user's MT5-under-Wine terminal (`config.LIVE["bridge_dir"]` points a
 `pgrep -fl nas100_rl.live.runner`) before killing python processes, restarting, or
 editing live-path code; a flock in `data_cache/live_runner.lock` rejects a second
 instance. Decisions/orders/heartbeats append to `data_cache/live_journal.jsonl`;
-crash output goes to `data_cache/live_runner.log`. If a runner died with open
-positions, they are NOT re-adopted on restart (server-side stops still protect them) —
-surface this to the user instead of silently restarting. The user starts/stops the
+crash output goes to `data_cache/live_runner.log`. On restart the runner re-adopts
+its state from `data_cache/live_state.json` (model account, open broker tickets, halt
+flag) and heals missing bars from the gateway backlog — deleting `live_state.json`
+deliberately resets the model account to a fresh 100k. The user starts/stops the
 runner themselves; never launch it unasked.
 
 ## Cardinal rules
@@ -121,7 +122,10 @@ Periods (train/val/oos) come from the three CSVs and are carried as labels throu
 dataset; `evaluate.load_all(basis)` returns the `world` dict (signals, feature matrix,
 mark prices, day grid, period index ranges) that all evaluation entry points share.
 
-`data_cache/` is fully derived (delete to force rebuild; loaders take `refresh=True`).
+`data_cache/` is MOSTLY derived (loaders take `refresh=True`), but since go-live it
+also holds irreplaceable live state: `live_journal.jsonl`, `live_m1.parquet`,
+`live_state.json`, `live_runner.lock`. Never blanket-delete the directory while
+deployed — refresh individual derived caches instead.
 `resample()`/`daily()` caches carry a `.meta.json` input fingerprint: a sliced input
 computes fresh instead of reading the full-history cache, and a narrower input can
 never overwrite a wider cache (only `refresh=True` forces a write) — keep this guard

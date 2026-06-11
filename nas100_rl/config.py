@@ -145,7 +145,8 @@ LIVE = dict(
     usd_per_point_per_lot=1.0,           # fallback; overridden by broker symbol spec
     lot_step=0.01,
     min_lot=0.01,
-    magic={"s2": 771001, "dmi": 771002, "cpmt": 771003},
+    magic=771000,                        # NasBridge InpMagic — stamps every runner order
+                                         # (distinguishes them from manual/other-EA trades)
     # windowed-replay spans: long enough for bit-convergent indicators + all
     # path-dependent state (positions, day-state, pattern buffers); parity is
     # asserted against the frozen signal stream by `runner --selftest`

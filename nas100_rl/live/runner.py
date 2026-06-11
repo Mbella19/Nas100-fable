@@ -60,6 +60,46 @@ def _mk_emission_from_row(r) -> dict:
                 stream=int(r.stream), width=float(r.width))
 
 
+def _prep_live_bars(bars: pd.DataFrame) -> pd.DataFrame:
+    bars = bars.copy()
+    bars["period"] = "live"
+    return data._add_time_columns(bars)
+
+
+def _merge_backlog(m1: pd.DataFrame, back: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Startup-only gap healing: insert backlog bars missing from held history
+    (engines must see one consistent timeline from their first step). The
+    steady-state loop stays strictly-append — never splice bars mid-run."""
+    if back is None or not len(back):
+        return m1, 0
+    back = back.drop_duplicates("srv")
+    new = back[~back["srv"].isin(m1["srv"]) & (back["srv"] > m1["srv"].iloc[0])]
+    if not len(new):
+        return m1, 0
+    m1 = (pd.concat([m1, _prep_live_bars(new)], ignore_index=True)
+          .sort_values("srv", kind="mergesort", ignore_index=True))
+    return m1, len(new)
+
+
+def _gap_spans(m1: pd.DataFrame, lookback_days: int = 45) -> list[tuple[str, str]]:
+    """Missing-session detector over the recent timeline: jumps wider than a
+    session boundary that aren't the weekend shape (holidays may false-positive
+    — this only feeds a journal warning, never a behavior change)."""
+    srv = m1.loc[m1["srv"] >= m1["srv"].iloc[-1] - pd.Timedelta(days=lookback_days),
+                 "srv"].reset_index(drop=True)
+    dt = srv.diff()
+    out = []
+    # one cleanly missing session = a 25h jump (23:59 -> 01:00 two days later);
+    # the ordinary overnight jump is 1h — 20h splits them with margin
+    for i in np.where(dt > pd.Timedelta(hours=20))[0]:
+        a, b = srv.iloc[i - 1], srv.iloc[i]
+        if a.dayofweek == 4 and b.dayofweek in (6, 0) \
+                and dt.iloc[i] <= pd.Timedelta(hours=56):
+            continue                                   # ordinary weekend
+        out.append((str(a), str(b)))
+    return out
+
+
 class Journal:
     def __init__(self, path: Path):
         self.path = path
@@ -180,6 +220,7 @@ def selftest(quick: bool = False, cpmt_every: int = 1) -> bool:
     worst = 0.0
     worst_name = ""
     mark_dev = 0.0
+    z_live: dict[int, np.ndarray] = {}     # live-built vectors, reused by [3b]
     for k, i in enumerate(val_idx):
         r = fdf.iloc[i]
         fr = frozen[frozen["trade_id"] == r["trade_id"]].iloc[0]
@@ -187,6 +228,7 @@ def selftest(quick: bool = False, cpmt_every: int = 1) -> bool:
             .tz_convert(config.NY_TZ).tz_localize(None) + pd.Timedelta(hours=7)
         m1_thru = m1[m1["srv"] < sig_day_end.normalize() + pd.Timedelta(days=1)]
         z, mark = fb.row(_mk_emission_from_row(fr), m1_thru)
+        z_live[int(i)] = z
         d = np.abs(z - fmat[i])
         if d.max() > worst:
             worst = float(d.max()); worst_name = names[int(d.argmax())]
@@ -233,6 +275,34 @@ def selftest(quick: bool = False, cpmt_every: int = 1) -> bool:
           f"({int((1-agree)*len(mine))} of {len(mine)} differ)")
     ok_all &= bool(agree == 1.0)
 
+    # ---- 3b) decisions again, on the LIVE-built feature vectors --------------
+    # [2] proves live z ~ cached within 5e-3 and [3] proves cached z -> identical
+    # actions; this closes the composition gap: the vectors the live builder
+    # actually produces must yield the identical action sequence end-to-end.
+    chk = list(val_idx[:5])
+    assert all(np.allclose(world["feats"][i], fmat[i], atol=1e-6) for i in chk), \
+        "feature matrix misaligned between features.build and evaluate.load_all"
+    acct2 = ModelAccount(mode="parity")
+    mine_live = []
+    for i in range(i0, i1):
+        r = sig.iloc[i]
+        acct2.on_signal(int(r["signal_ms"]), float(world["mark"][i]))
+        z = z_live.get(int(i), world["feats"][i])
+        o = np.concatenate([z, acct2.obs_port()])
+        a = int(pol(o, i))
+        mine_live.append(a)
+        qty = acct2.size(r["strategy"], float(r["stop_dist"]), A_MULTS[a])
+        if qty > 0:
+            acct2.register((r["strategy"], int(r["signal_ms"]), int(r["direction"])),
+                           r["strategy"], int(r["direction"]), qty, float(r["stop_dist"]),
+                           int(r["entry_ms"]), float(r["entry_price"]),
+                           exit_ms=int(r["exit_ms"]), pc_pnl=float(r["pc_pnl"]))
+    agree_b = float(np.mean(np.array(mine_live) == np.array(env_actions)))
+    n_lz = sum(1 for i in range(i0, i1) if int(i) in z_live)
+    print(f"[3b] decisions on live-built features: {agree_b:.1%} agreement "
+          f"({n_lz}/{i1 - i0} decisions covered by live z)")
+    ok_all &= bool(agree_b == 1.0)
+
     print(f"\nselftest {'PASS' if ok_all else 'FAIL'} in {time.time()-t0:.0f}s")
     return ok_all
 
@@ -246,16 +316,29 @@ class LiveRunner:
         self.basis = basis
         self.journal = Journal(journal_path or config.CACHE_DIR / L["journal"])
         self.frozen = frozen if frozen is not None else sigmod.build(basis=basis)
+        healed = 0
         if m1 is None:
             m1 = data.load_1min().copy()
             store = config.CACHE_DIR / L["live_store"]
             if store.exists():
-                m1 = pd.concat([m1, pd.read_parquet(store)], ignore_index=True)
+                m1 = (pd.concat([m1, pd.read_parquet(store)], ignore_index=True)
+                      .drop_duplicates("srv", keep="first")
+                      .sort_values("srv", kind="mergesort", ignore_index=True))
+            # heal holes from whatever history the gateway can serve (EA bars.csv
+            # backfill / MT5 deep history) BEFORE the engines fix their timeline;
+            # restarts used to shrink the store and leave such holes behind
+            m1, healed = _merge_backlog(m1, self.gw.backlog())
             self.store_path = store
+            self.state_path = config.CACHE_DIR / "live_state.json"
         else:
             self.store_path = store_path or (config.CACHE_DIR / "paper_m1.parquet")
+            self.state_path = self.store_path.with_suffix(".state.json")
         self.m1 = m1
         self.live_from_ms = int(self.m1["utc_ms"].iloc[-1]) + 1
+        if healed:
+            self.journal.log(ev="gap_heal", bars=int(healed))
+        for a, b in _gap_spans(self.m1):
+            self.journal.log(ev="gap_warning", span=[a, b])
         self.engines = {}
         for name in ("s2", "dmi", "cpmt"):
             pre = self.frozen[self.frozen["strategy"] == name]
@@ -275,21 +358,65 @@ class LiveRunner:
         self.spec = spec
         self.tickets: dict = {}            # trade_key -> broker ticket
         self.halted = False
+        self._restore_state()              # re-adopt account/tickets/halt flag
         self.journal.log(ev="start", live_from_ms=self.live_from_ms, spec=spec)
+
+    # ----------------------------------------------------------------- state
+    def _save_state(self):
+        """Persist what a restart must not lose: the model account (source of
+        the policy's portfolio observations), open broker tickets, halt flag."""
+        st = self.acct.to_state()
+        st["open"] = [dict(t, trade_key=list(t["trade_key"])) for t in st["open"]]
+        out = dict(acct=st,
+                   tickets=[[list(k), v] for k, v in self.tickets.items()],
+                   halted=self.halted,
+                   last_bar_ms=int(self.m1["utc_ms"].iloc[-1]),
+                   ts=pd.Timestamp.utcnow().isoformat())
+        tmp = self.state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(out))
+        tmp.replace(self.state_path)
+
+    def _restore_state(self):
+        if not self.state_path.exists():
+            return
+        try:
+            st = json.loads(self.state_path.read_text())
+            acct = ModelAccount.from_state(st["acct"])
+            fresh, stale = [], set()
+            for t in acct.open:
+                t["trade_key"] = tuple(t["trade_key"])
+                # engines absorb (never re-emit) entries >30d before live start,
+                # so a trade that old could never settle — drop it loudly
+                if t["entry_ms"] < self.live_from_ms - 25 * 86_400_000:
+                    stale.add(t["trade_key"])
+                else:
+                    fresh.append(t)
+            acct.open = fresh
+            self.acct = acct
+            self.tickets = {tuple(k): v for k, v in st.get("tickets", [])
+                            if tuple(k) not in stale}
+            self.halted = bool(st.get("halted", False))
+            self.journal.log(ev="state_restored", open=len(fresh),
+                             tickets=len(self.tickets), halted=self.halted,
+                             equity=round(acct.mark_eq, 2), saved=st.get("ts"),
+                             dropped_stale=[str(k) for k in stale])
+        except Exception as ex:            # corrupt state: start fresh, loudly
+            self.journal.log(ev="state_restore_failed", err=repr(ex))
 
     # ----------------------------------------------------------------- bars
     def _append_bars(self, bars: pd.DataFrame) -> pd.DataFrame:
         # the EA's startup backfill (and any re-read after restart) overlaps
         # bars we already hold — keep strictly newer bars only, and return them
         # so the event loop never re-grinds engines over already-seen bars
-        bars = bars[bars["srv"] > self.m1["srv"].iloc[-1]].copy()
+        bars = bars[bars["srv"] > self.m1["srv"].iloc[-1]]
         if not len(bars):
             return bars
-        bars["period"] = "live"
-        bars = data._add_time_columns(bars)
+        bars = _prep_live_bars(bars)
         self.m1 = pd.concat([self.m1, bars], ignore_index=True)
-        # persist the live tail (atomic replace; cheap at live-tail sizes)
-        tail = self.m1[self.m1["utc_ms"] >= self.live_from_ms]
+        # persist EVERY live bar ever seen (atomic replace). This must stay a
+        # union: rewriting only the current session's tail is what carved the
+        # June-10 hole — each restart silently discarded its predecessors' bars
+        tail = self.m1[self.m1["period"] == "live"]
         tmp = self.store_path.with_suffix(".tmp.parquet")
         tail.to_parquet(tmp, index=False)
         tmp.replace(self.store_path)
@@ -412,6 +539,7 @@ class LiveRunner:
                 if dd > 0.35 and not self.halted:
                     self.halted = True
                     self.journal.log(ev="KILL_SWITCH", dd=dd)
+                self._save_state()
             # proof-of-life heartbeat: the system is silent between signals,
             # so emit a status line every minute regardless of activity
             if time.time() - getattr(self, "_last_hb", 0.0) >= 60:
@@ -422,6 +550,7 @@ class LiveRunner:
                                  open_trades=len(self.acct.open),
                                  closed_trades=len(self.acct.ledger),
                                  halted=self.halted)
+                self._save_state()
             polls += 1
             if max_polls and polls >= max_polls:
                 return
@@ -466,6 +595,18 @@ def status():
     ptxt = pos.read_text().strip() if pos.exists() else ""
     print(f"broker positions: {len(ptxt.splitlines()) if ptxt else 0} open"
           + (("\n  " + "\n  ".join(ptxt.splitlines())) if ptxt else ""))
+
+    st_p = config.CACHE_DIR / "live_state.json"
+    if st_p.exists():
+        try:
+            st = _json.loads(st_p.read_text())
+            age = time.time() - st_p.stat().st_mtime
+            print(f"saved state     : {len(st['acct']['open'])} open model trades, "
+                  f"{len(st.get('tickets', []))} tickets"
+                  + (", HALTED" if st.get("halted") else "")
+                  + f" | written {age:,.0f}s ago")
+        except (ValueError, KeyError, OSError):
+            print("saved state     : unreadable")
 
     J = config.CACHE_DIR / L["journal"]
     if not J.exists():
@@ -527,8 +668,9 @@ def main():
         frozen = sigmod.build(basis="live")
         frozen = frozen[frozen["signal_ms"] < start_ms].reset_index(drop=True)
         store = config.CACHE_DIR / "paper_m1.parquet"
-        if store.exists():
-            store.unlink()
+        for p in (store, store.with_suffix(".state.json")):
+            if p.exists():
+                p.unlink()
         r = LiveRunner(gw.ReplayGateway(feed, start=start, bars_per_poll=30),
                        basis="live", m1=hist, frozen=frozen,
                        journal_path=config.CACHE_DIR / "paper_journal.jsonl",

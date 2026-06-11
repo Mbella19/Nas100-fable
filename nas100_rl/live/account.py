@@ -42,13 +42,15 @@ class ModelAccount:
     def to_state(self) -> dict:
         return dict(mode=self.mode, e0=self.e0, cash=self.cash, open=self.open,
                     peak=self.peak, prev_mark_eq=self.prev_mark_eq,
-                    ret_hist=self.ret_hist[-200:], n_decisions=self.n_decisions)
+                    mark_eq=self.mark_eq, ret_hist=self.ret_hist[-200:],
+                    n_decisions=self.n_decisions, n_closed=len(self.ledger))
 
     @classmethod
     def from_state(cls, st: dict) -> "ModelAccount":
         a = cls(mode=st["mode"], equity0=st["e0"])
         a.cash = st["cash"]; a.open = st["open"]; a.peak = st["peak"]
         a.prev_mark_eq = st["prev_mark_eq"]; a.ret_hist = list(st["ret_hist"])
+        a.mark_eq = float(st.get("mark_eq", a.mark_eq))
         a.n_decisions = st["n_decisions"]
         return a
 
